@@ -213,8 +213,10 @@ runs **Build + L0 + L1 + L6** on Windows, macOS and Linux (runners cannot host t
 ~1.5 TB checkpoint); the **L2–L5** gates (goldens, benchmark, end-to-end) require
 the real checkpoint and run on the model-hosting machine via
 `python scripts/validate.py --model <dir> --report`.
-Pushing a `v*` tag runs the gate again on all three OS, packages the archives,
-and **auto-publishes a GitHub Release** once every job passes. See `doc/design.md`
+Merging to the default branch packages the archives on all three OS and
+**auto-publishes a GitHub Release** `v<version>` (version read from
+`scripts/sync_version.py`) once every job passes; if that version already has a
+release, publishing is skipped. See `doc/design.md`
 §10–§11 for the full contract.
 
 | Level | What | Runs without weights? | Command |
@@ -391,7 +393,7 @@ HummingFlight/
 |-- doc/
 |   `-- design.md                   # Design + validation contract (English)
 |-- .github/workflows/
-|   `-- ci.yml                      # Build + L0/L1/L6 on win/mac/linux; v* tag: gates + CPack + auto-publish GitHub Release
+|   `-- ci.yml                      # Build + L0/L1/L6 on win/mac/linux; default-branch push: gates + CPack + auto-publish GitHub Release (version from sync_version.py)
 |-- tools/
 |   |-- tokenizer_server.py         # Tokenizer subprocess service
 |   `-- test_tokenizer.py

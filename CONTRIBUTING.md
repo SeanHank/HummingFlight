@@ -83,7 +83,8 @@ test, and keep the README table in sync.
 - Commit messages follow conventional style: `area: summary`. Pinned goldens
   (`tests/golden/`) are part of the change when behavior is re-verified, and
   only when the diff reproduces exactly on the reference machine.
-- Reports and release artifacts land with the tag/release, not with code edits.
+- Reports and release artifacts land with the auto-published GitHub Release
+  (version from `scripts/sync_version.py`), not with code edits.
 
 ## Reporting issues
 

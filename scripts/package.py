@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """package.py - one-click release packaging for HummingFlight.
 
-Pipeline (matches GitHub Actions ci.yml; a pushed `v*` tag publishes the
-GitHub Release automatically after Build + L0 + L1 + L6 + CPack pass):
+Pipeline (matches GitHub Actions ci.yml; merging to the default branch
+auto-publishes the GitHub Release after Build + L0 + L1 + L6 + CPack pass,
+named `v<version>` from the single version source scripts/sync_version.py):
   1. Synchronize the project-wide version (single source: scripts/sync_version.py)
   2. Configure + build the engine (Release)
   3. Run ALL quality gates to 100% (design.md §10):
