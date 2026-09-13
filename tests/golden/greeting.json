@@ -1,0 +1,14 @@
+{
+  "name": "greeting",
+  "prompt": "Hello",
+  "max_tokens": 4,
+  "raw": true,
+  "version": "2026.9.0",
+  "tokens": [
+    5607,
+    16,
+    13,
+    16
+  ],
+  "signature": "H6144_L78_V154880_Hd64_Kv64_E256_T8_I12288_M2048_S1"
+}

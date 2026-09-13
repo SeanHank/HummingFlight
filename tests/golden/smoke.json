@@ -1,0 +1,11 @@
+{
+  "name": "smoke",
+  "prompt": "hi",
+  "max_tokens": 1,
+  "raw": true,
+  "version": "2026.9.0",
+  "tokens": [
+    5607
+  ],
+  "signature": "H6144_L78_V154880_Hd64_Kv64_E256_T8_I12288_M2048_S1"
+}

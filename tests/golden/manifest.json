@@ -1,0 +1,7 @@
+{
+  "version": "2026.9.0",
+  "cases": [
+    "smoke.json",
+    "greeting.json"
+  ]
+}

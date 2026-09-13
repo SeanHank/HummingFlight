@@ -1,0 +1,9 @@
+{
+  "version": "2026.9.0",
+  "model_dir": "E:\\glm-5.2-bf16",
+  "metrics": {
+    "generated_tokens": 4,
+    "total_sec": 5875.710399,
+    "speed_tok_per_s": 0.000681
+  }
+}

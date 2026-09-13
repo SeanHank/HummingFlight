@@ -1,0 +1,56 @@
+# Build outputs
+build*/
+out/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# CMake / IDE
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.virtual_dirs/
+
+# Packaging
+dist/
+*.zip
+*.tar.gz
+*.deb
+*.dmg
+
+# Local junk / logs
+run_log*.txt
+test.txt
+*.log
+tokenizer_dump.json
+stdout*.txt
+
+# Environment
+.env
+.env.local
+
+# Windows
+Thumbs.db
+Desktop.ini
