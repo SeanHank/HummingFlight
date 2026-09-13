@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compute/cuda_backend.h"
 #include "compute/dtype_bf16.h"
 #include "engine/kv_cache.h"
 #include "engine/scheduler.h"
@@ -34,6 +35,15 @@ public:
     // Attach the scheduler pipeline (optional; enables LRU/IOCP expert serving).
     void attachScheduler(Scheduler* s) { scheduler_ = s; }
     Scheduler* scheduler() const { return scheduler_; }
+
+    // Opt-in GPU expert FFN (#1/#2, --gpu-experts <n>). Off by default so the
+    // CPU pipeline (and golden outputs) is unchanged. Falls back to the CPU
+    // implementation per layer whenever the device is absent or a call fails.
+    // `capacity` bounds the VRAM-resident expert window (number of experts);
+    // `stagingDepth` is how many experts are staged ahead of compute (deep
+    // staging: compute(N) || H2D(N+1) ... || H2D(N+stagingDepth)).
+    void enableGpuExperts(int capacity, int stagingDepth = 2);
+    bool gpuExpertsEnabled() const { return gpuExperts_; }
 
     // Single token forward (incremental inference)
     // inputIds: full input sequence (including history), returns next token id.
@@ -100,8 +110,13 @@ private:
     // RoPE (decoupled, interleave mode)
     void applyRoPE(float* x, int dim, int pos, int offset, bool interleave);
 
-    // Read BF16 weight from TensorLocation and convert to F32
+    // Load numel elements of a tensor into a float buffer, honoring the tensor's
+    // declared dtype (BF16, or F32 -- GLM-5.2 stores the noaux_tc router
+    // score-correction bias as float32 per config moe_router_dtype=float32).
     bool loadWeightToF32(const TensorLocation& loc, float* buf, int numel);
+
+    // Raw mmap view of a tensor's data (dtype-agnostic).
+    const uint8_t* getWeightRaw(const TensorLocation& loc);
 
     // Get BF16 pointer directly from TensorLocation (mmap view)
     const BFloat16* getWeightPtr(const TensorLocation& loc);
@@ -109,10 +124,36 @@ private:
     // Final norm + LM head. Greedy argmax or full logits output.
     int lmHeadAndSample(const float* hiddenStates, std::vector<float>* logitsOut);
 
+    // Preallocated per-token scratch buffers (DSA + expert pipeline; item 12:
+    // workspace reuse). Reused across forward() calls and grow-only, so the hot
+    // path never allocates per token/layer. Numerics are identical to the
+    // previous per-call temporaries (same vectors, same data layout).
+    struct Workspace {
+        // DSA indexer
+        std::vector<float> iq, iK, wVec;
+        std::vector<std::pair<float, int>> ranked;
+        // MLA attention
+        std::vector<float> qResid, qB, qNope, qRope, kvA, kvLatent, kRope,
+                          expandedNew, kNew, vNew, attnOut, qCur, scores;
+        // Router / FFN (shared across dense/expert/shared: sized to the largest
+        // intermediate dimension; calls are sequential so reuse is safe)
+        std::vector<float> routerScores, bias, gate, up, mid, moeOut, expertOut, sharedOut;
+        // forward() layer + lm head scratch
+        std::vector<float> hiddenStates, residual, attnOutL, mlpOut, normed;
+    };
+    Workspace ws_;
+
+    // Grow-only ensure helper: keeps the buffer at least n floats; no shrink.
+    static void ensureFloat(std::vector<float>& v, size_t n) {
+        if (v.size() < n) v.resize(n);
+    }
+
     WeightIndex* index_;
     Scheduler* scheduler_ = nullptr;
     bool initialized_ = false;
     bool dsaEnabled_ = false;
+    bool gpuExperts_ = false;
+    int gpuStagingDepth_ = 2;
     int seqLen_ = 0;
 
     // Expanded per-head KV + indexer key cache

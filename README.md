@@ -197,6 +197,7 @@ cd HummingFlight
 | `--raw` | Skip chat template, encode prompt directly | off |
 | `--max-tokens <n>` | Max tokens to generate. `-1` = unlimited (stop on EOS) | `-1` |
 | `--python <path>` | Python interpreter path | conda env |
+| `--tokenizer <python\|native>` | Tokenizer backend: `python` subprocess (default, byte-identical to reference) or in-process `native` BPE | `python` |
 | `--no-gpu` | Disable CUDA backend | off |
 | `--verbose` | Enable debug logging (per-layer timing) | off |
 | `--version` | Print version and exit | — |
@@ -221,9 +222,9 @@ release, publishing is skipped. See `doc/design.md`
 
 | Level | What | Runs without weights? | Command |
 |---|---|---|---|
-| L0 | Functional self-tests (BF16, GEMV, RMSNorm, softmax, sigmoid, top-K router, compressed-MLA KV cache, LRU, placement, config parser, sampler, adaptive runtime config — 96 checks) | ✅ | `build\Release\glm_tests.exe` or `glm.exe --self-test` |
-| L1 | Python contract tests (version consistency, fixtures, golden contract, binary black-box) | ✅ | `python -m pytest tests/ -v` |
-| L2 | Structural model validation (index, shards, tensor layout) | needs model | `glm.exe --check-weights --model <dir>` |
+| L0 | Functional self-tests (BF16, GEMV incl. ILP-unrolled kernels, RMSNorm, softmax, sigmoid, top-K router, compressed-MLA KV cache incl. reserve + head-major layout, LRU incl. soft-boost, placement, config parser incl. MTP + GLM-5.2 nextn keys, sampler incl. min-p + repetition/frequency/presence penalties + typical-p + 13-arg equivalence, adaptive runtime config, strict safetensors validation incl. data alignment + F32 allow-list for the router bias, item-7 structural completeness, weight-index MTP detection — 162 checks) | ✅ | `build\Release\glm_tests.exe` or `glm.exe --self-test` |
+| L1 | Python contract tests (version consistency, fixtures, golden contract, binary black-box incl. strict opt-in errors, benchmark STATS/telemetry parser, native tokenizer parity — 28 tests) | ✅ | `python -m pytest tests/ -v` |
+| L2 | Structural model validation (index, shards, tensor layout, per-layer completeness, per-expert gate/up/down + shape-vs-config, MTP config consistency — 0 failures on the real GLM-5.2 checkpoint) | needs model | `glm.exe --check-weights --model <dir>` |
 | L3 | Golden inference outputs (greedy token ids, byte-for-byte) | needs model | `python scripts/record_golden.py --model <dir>` then `scripts/validate.py --model <dir>` |
 | L4 | Performance benchmark | needs model | `python scripts/benchmark.py --model <dir> --report` |
 | L5 | End-to-end pipeline (fast real-model e2e: tokenizer round-trip + weight index/tensor loading only — no forward generation) | needs model | `python scripts/run_e2e.py --model <dir> --report` |
@@ -373,7 +374,9 @@ HummingFlight/
 |   |   |-- scheduler.*             # Async expert prefetch pipeline
 |   |   `-- kv_cache.*              # MLA KV cache (dynamic growth)
 |   |-- tokenizer/
-|   |   `-- python_tokenizer.*      # C++ <-> Python subprocess
+|   |   |-- python_tokenizer.*      # C++ <-> Python subprocess
+|   |   |-- native_tokenizer.*      # Opt-in native BPE backend (tokenizer.json)
+|   |   `-- unicode_ranges.h        # Generated Unicode category tables
 |   `-- utils/
 |       |-- logger.h
 |       `-- timer.h

@@ -57,18 +57,23 @@ if(OpenMP_CXX_FOUND)
 endif()
 
 # ---------- Compile options ----------
+# MSVC flags are scoped to CXX sources: CUDA sources (nvcc) must never receive
+# raw cl-style flags, otherwise nvcc treats them as additional input files.
 if(MSVC)
-    add_compile_options(/W3 /utf-8 /EHsc /permissive-)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W3>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/permissive->)
     if(ENABLE_AVX2)
-        add_compile_options(/arch:AVX2)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
     endif()
     # OpenMP: MSVC built-in /openmp (manually added if find_package fails)
     if(NOT OpenMP_CXX_FOUND)
-        add_compile_options(/openmp)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/openmp>)
         message(STATUS "OpenMP: using MSVC /openmp flag")
     endif()
     # Release optimization
-    add_compile_options($<$<CONFIG:Release>:/O2>)
+    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:/O2>)
 endif()
 
 # ---------- Source files ----------
@@ -108,7 +113,9 @@ endif()
 add_executable(glm ${GLM_ALL_SOURCES})
 
 target_include_directories(glm PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 # GLM_* version macros come from src/version.h (managed by scripts/sync_version.py).
@@ -141,11 +148,15 @@ if(BUILD_TESTING)
         src/model/safetensors.cpp
         src/model/glm_forward.cpp
         src/compute/cpu_kernels.cpp
+        src/compute/cuda_backend.cpp
         src/runtime/runtime_config.cpp
+        src/tokenizer/native_tokenizer.cpp
         tests/run_tests.cpp
     )
     target_include_directories(glm_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     )
     if(WIN32)
         target_sources(glm_tests PRIVATE

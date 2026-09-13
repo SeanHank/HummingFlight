@@ -22,6 +22,10 @@ named `v<version>` from the single version source scripts/sync_version.py):
      when available) into the dist/ directory
   6. Any packaging step that fails aborts the whole run (release gate)
 
+All third-party code is vendored (e.g. `third_party/picojson.h`, header-only
+BSD JSON parser); packaging performs no network fetch, so the build is fully
+offline and deterministic.
+
 Usage:
   python scripts/package.py --model <dir>    # full 100% gate incl. L2/L3/L4/L5
   python scripts/package.py --version X.Y.Z  # bump before packaging

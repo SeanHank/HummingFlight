@@ -1,44 +1,50 @@
 #include "model/weight_index.h"
 #include "model/safetensors.h"
+#include "third_party/picojson.h"
 #include "utils/logger.h"
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <iterator>
+#include <set>
 
 namespace glm {
 
 namespace fs = std::filesystem;
 
-// Extract tensor -> shard filename mapping from index.json
+// Strict safetensors options for checkpoint loading (item 7): BF16-only with a
+// single explicit F32 exception -- GLM-5.2 stores the noaux_tc router
+// score-correction bias (e_score_correction_bias) as float32 per
+// config moe_router_dtype: float32. Everything else must be BF16.
+SafeTensorsOptions strictStOpts() {
+    SafeTensorsOptions o;
+    o.requireBf16 = true;
+    o.requireAlignedHeader = true;
+    o.requireAlignedData = true;
+    o.allowF32NameContaining.push_back("e_score_correction_bias");
+    return o;
+}
+
+// Extract tensor -> shard filename mapping from index.json (real JSON parser;
+// the previous hand-rolled string search is gone as part of the JSON upgrade).
 static std::unordered_map<std::string, std::string> parseIndexJson(const std::string& path) {
     std::unordered_map<std::string, std::string> result;
     std::ifstream f(path);
     if (!f.is_open()) return result;
-    std::stringstream ss;
-    ss << f.rdbuf();
-    std::string content = ss.str();
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 
-    size_t wm = content.find("\"weight_map\"");
-    if (wm == std::string::npos) return result;
-    size_t pos = content.find('{', wm);
-    if (pos == std::string::npos) return result;
-    pos++;
-
-    while (pos < content.size() && content[pos] != '}') {
-        while (pos < content.size() && (content[pos] == ' ' || content[pos] == ',' || content[pos] == '\n' || content[pos] == '\t')) pos++;
-        if (pos >= content.size() || content[pos] == '}' || content[pos] != '"') { if (pos < content.size() && content[pos] != '}') pos++; continue; }
-        size_t nameEnd = content.find('"', pos + 1);
-        if (nameEnd == std::string::npos) break;
-        std::string tensorName = content.substr(pos + 1, nameEnd - pos - 1);
-        size_t colon = content.find(':', nameEnd);
-        if (colon == std::string::npos) break;
-        size_t shardStart = content.find('"', colon);
-        size_t shardEnd = content.find('"', shardStart + 1);
-        if (shardEnd == std::string::npos) break;
-        std::string shardName = content.substr(shardStart + 1, shardEnd - shardStart - 1);
-        result[tensorName] = shardName;
-        pos = shardEnd + 1;
+    picojson::value root;
+    const std::string err = picojson::parse(root, content);
+    if (!err.empty()) return result;
+    if (!root.is<picojson::object>()) return result;
+    const picojson::object& rootObj = root.get<picojson::object>();
+    auto wm = rootObj.find("weight_map");
+    if (wm == rootObj.end() || !wm->second.is<picojson::object>()) return result;
+    for (const auto& [tensorName, shardValue] : wm->second.get<picojson::object>()) {
+        if (shardValue.is<std::string>()) {
+            result[tensorName] = shardValue.get<std::string>();
+        }
     }
     return result;
 }
@@ -48,6 +54,19 @@ static int extractLayerNum(const std::string& name) {
     size_t p = name.find("layers.");
     if (p == std::string::npos) return -1;
     try { return std::stoi(name.substr(p + 7)); } catch (...) { return -1; }
+}
+
+// Extract layer number from "model.nextn_predict_layers.<i>..." / "model.mtp_layers.<i>...",
+// or -1 when not an MTP layer tensor.
+static int extractMtpLayerNum(const std::string& name) {
+    static const char* kPatterns[] = {"nextn_predict_layers.", "mtp_layers."};
+    for (const char* pat : kPatterns) {
+        size_t p = name.find(pat);
+        if (p != std::string::npos) {
+            try { return std::stoi(name.substr(p + strlen(pat))); } catch (...) { return -1; }
+        }
+    }
+    return -1;
 }
 
 // Extract expert number: "model.layers.10.mlp.experts.123.xxx" -> 123
@@ -109,12 +128,14 @@ bool WeightIndex::build(const std::string& dir) {
         }
 
         int totalExperts = 0;
+        std::set<int> mtpLayersSeen;
+        bool sawMtpHead = false;
         for (const auto& [shardName, tensorNames] : shardToTensors) {
             auto pathIt = shardNameToPath.find(shardName);
             if (pathIt == shardNameToPath.end()) continue;
 
             SafeTensorsFile st;
-            if (!st.open(pathIt->second)) continue;
+            if (!st.open(pathIt->second, strictStOpts())) continue;
 
             for (const auto& tensorName : tensorNames) {
                 const TensorInfo* info = st.find(tensorName);
@@ -129,6 +150,8 @@ bool WeightIndex::build(const std::string& dir) {
 
                 // Dispatch to corresponding location
                 int layer = extractLayerNum(tensorName);
+                if (tensorName.rfind("model.layers.", 0) == 0 && layer > maxSeenBaseLayer)
+                    maxSeenBaseLayer = layer;
 
                 if (tensorName == "model.embed_tokens.weight") {
                     embedTokens = loc;
@@ -136,6 +159,20 @@ bool WeightIndex::build(const std::string& dir) {
                     lmHead = loc;
                 } else if (tensorName == "model.norm.weight") {
                     finalNorm = loc;
+                } else if (extractMtpLayerNum(tensorName) >= 0 ||
+                           tensorName.find("nextn_predict_head") != std::string::npos ||
+                           tensorName.find("mtp_head") != std::string::npos) {
+                    // MTP tensors. NOTE: this branch MUST run before the generic
+                    // branch below -- "nextn_predict_layers." contains the
+                    // substring "layers." so extractLayerNum would otherwise
+                    // misroute an MTP tensor into the base layer wheel.
+                    hasMtpTensors = true;
+                    int m = extractMtpLayerNum(tensorName);
+                    if (m >= 0) mtpLayersSeen.insert(m);
+                    if (tensorName.find("nextn_predict_head") != std::string::npos ||
+                        tensorName.find("mtp_head") != std::string::npos ||
+                        tensorName.find("mtp.dense_with_embedding") != std::string::npos)
+                        sawMtpHead = true;
                 } else if (layer >= 0 && layer < numLayers) {
                     auto& lw = layers[layer];
 
@@ -217,9 +254,14 @@ bool WeightIndex::build(const std::string& dir) {
                 totalExperts += int(routedExperts[i].size());
             }
         }
+        mtpTensorLayers = int(mtpLayersSeen.size());
+        hasMtpHead = sawMtpHead;
 
         GLM_LOG_INFO("Index build complete: " + std::to_string(totalExperts) + " routed experts, " +
-                     std::to_string(numLayers) + " layers");
+                     std::to_string(numLayers) + " layers" +
+                     (hasMtpTensors ? (", MTP layers: " + std::to_string(mtpTensorLayers) +
+                                       (hasMtpHead ? " + head" : " (no head)"))
+                                    : ", MTP: none"));
         return true;
     }
 
@@ -227,9 +269,11 @@ bool WeightIndex::build(const std::string& dir) {
     GLM_LOG_WARN("index.json not found, falling back to full shard header traversal");
 
     int totalExperts = 0;
+    std::set<int> mtpLayersSeen;
+    bool sawMtpHead = false;
     for (const auto& shardPath : shardFiles) {
         SafeTensorsFile st;
-        if (!st.open(shardPath)) continue;
+        if (!st.open(shardPath, strictStOpts())) continue;
 
         for (const auto& [name, info] : st.tensors()) {
             TensorLocation loc;
@@ -240,6 +284,8 @@ bool WeightIndex::build(const std::string& dir) {
             loc.dtype = info.dtype;
 
             int layer = extractLayerNum(name);
+            if (name.rfind("model.layers.", 0) == 0 && layer > maxSeenBaseLayer)
+                maxSeenBaseLayer = layer;
 
             if (name == "model.embed_tokens.weight") {
                 embedTokens = loc;
@@ -247,6 +293,18 @@ bool WeightIndex::build(const std::string& dir) {
                 lmHead = loc;
             } else if (name == "model.norm.weight") {
                 finalNorm = loc;
+            } else if (extractMtpLayerNum(name) >= 0 ||
+                       name.find("nextn_predict_head") != std::string::npos ||
+                       name.find("mtp_head") != std::string::npos) {
+                // MTP tensors -- must be detected before the generic "layers."
+                // dispatch (see comment in the index.json fast path).
+                hasMtpTensors = true;
+                int m = extractMtpLayerNum(name);
+                if (m >= 0) mtpLayersSeen.insert(m);
+                if (name.find("nextn_predict_head") != std::string::npos ||
+                    name.find("mtp_head") != std::string::npos ||
+                    name.find("mtp.dense_with_embedding") != std::string::npos)
+                    sawMtpHead = true;
             } else if (layer >= 0 && layer < numLayers) {
                 auto& lw = layers[layer];
 
@@ -320,9 +378,14 @@ bool WeightIndex::build(const std::string& dir) {
             totalExperts += int(routedExperts[i].size());
         }
     }
+    mtpTensorLayers = int(mtpLayersSeen.size());
+    hasMtpHead = sawMtpHead;
 
     GLM_LOG_INFO("Index build complete: " + std::to_string(totalExperts) + " routed experts, " +
-                 std::to_string(numLayers) + " layers");
+                 std::to_string(numLayers) + " layers" +
+                 (hasMtpTensors ? (", MTP layers: " + std::to_string(mtpTensorLayers) +
+                                   (hasMtpHead ? " + head" : " (no head)"))
+                                : ", MTP: none"));
     return true;
 }
 

@@ -1,47 +1,55 @@
 #include "model/safetensors.h"
+#include "third_party/picojson.h"
 #include "utils/logger.h"
 #include <cstring>
-#include <sstream>
+#include <iterator>
+#include <map>
 
 namespace glm {
 
 namespace {
 
-// Safetensors-spec dtypes (subset actually used by this engine: BF16).
-bool isKnownDtype(const std::string& dtype) {
-    static const char* const kKnown[] = {
-        "F64", "F32", "F16", "BF16",
-        "I64", "I32", "I16", "I8",
-        "U64", "U32", "U8", "BOOL",
+// Safetensors-spec dtypes with their element byte size. The engine only writes
+// BF16 weights, but the full known set is honoured so mixed checkpoints are
+// reported with a specific reason instead of being silently mis-sized.
+const std::map<std::string, size_t>& knownDtypes() {
+    static const std::map<std::string, size_t> k = {
+        {"F64", 8}, {"F32", 4}, {"F16", 2}, {"BF16", 2},
+        {"I64", 8}, {"I32", 4}, {"I16", 2}, {"I8", 1},
+        {"U64", 8}, {"U32", 4}, {"U8", 1}, {"BOOL", 1},
     };
-    for (const char* k : kKnown) {
-        if (dtype == k) return true;
+    return k;
+}
+
+size_t dtypeByteSize(const std::string& dtype) {
+    auto it = knownDtypes().find(dtype);
+    return it == knownDtypes().end() ? 0 : it->second;
+}
+
+// Build the JSON header for a synthetic in-memory safetensors file.
+std::string buildHeader(const std::map<std::string, TensorInfo>& tensors) {
+    picojson::object root;
+    for (const auto& [name, info] : tensors) {
+        picojson::object t;
+        t["dtype"] = picojson::value(info.dtype);
+        picojson::array shape;
+        for (int s : info.shape) shape.push_back(picojson::value(double(s)));
+        t["shape"] = picojson::value(shape);
+        picojson::array offs;
+        offs.push_back(picojson::value(double(info.dataBegin)));
+        offs.push_back(picojson::value(double(info.dataEnd)));
+        t["data_offsets"] = picojson::value(offs);
+        root[name] = picojson::value(t);
     }
-    return false;
+    picojson::object meta;
+    meta["format"] = picojson::value("pt");
+    root["__metadata__"] = picojson::value(meta);
+    return picojson::value(root).serialize();
 }
 
 } // namespace
 
-// Minimal JSON array parser (extract integers from shape)
-static std::vector<int> parseIntArray(const std::string& json, size_t start) {
-    std::vector<int> result;
-    size_t pos = json.find('[', start);
-    if (pos == std::string::npos) return result;
-    pos++;
-    while (pos < json.size() && json[pos] != ']') {
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ',')) pos++;
-        if (pos >= json.size() || json[pos] == ']') break;
-        size_t end = pos;
-        while (end < json.size() && json[end] != ',' && json[end] != ']') end++;
-        try {
-            result.push_back(std::stoi(json.substr(pos, end - pos)));
-        } catch (...) {}
-        pos = end;
-    }
-    return result;
-}
-
-bool SafeTensorsFile::open(const std::string& path) {
+bool SafeTensorsFile::open(const std::string& path, const SafeTensorsOptions& opts) {
     filePath_ = path;
     fileStream_.open(path, std::ios::binary);
     if (!fileStream_.is_open()) {
@@ -62,6 +70,13 @@ bool SafeTensorsFile::open(const std::string& path) {
         return false;
     }
     headerSize_ = hsize + 8; // Data area start = 8 + header_size
+
+    // Spec: the JSON header length must be a multiple of 8 (strict mode).
+    if (opts.requireAlignedHeader && (hsize % 8) != 0) {
+        GLM_LOG_ERROR("safetensors header length not a multiple of 8 (" + path + "): " +
+                      std::to_string(hsize) + " bytes");
+        return false;
+    }
     if (headerSize_ + 8 > fileSize_) {
         GLM_LOG_ERROR("Header size exceeds file size: " + path);
         return false;
@@ -75,79 +90,137 @@ bool SafeTensorsFile::open(const std::string& path) {
         return false;
     }
 
-    // Parse tensors (simple state machine, looking for "name": { "dtype":..., "shape":..., "data_offsets":[...] })
-    size_t pos = 0;
-    while (pos < header.size()) {
-        // Find tensor name (quote-wrapped key)
-        size_t nameStart = header.find('"', pos);
-        if (nameStart == std::string::npos) break;
-        size_t nameEnd = header.find('"', nameStart + 1);
-        if (nameEnd == std::string::npos) break;
-        std::string name = header.substr(nameStart + 1, nameEnd - nameStart - 1);
+    // ---- Real JSON parse of the header (item 6: no handwritten JSON search) ----
+    picojson::value root;
+    const std::string err = picojson::parse(root, header);
+    if (!err.empty()) {
+        GLM_LOG_ERROR("safetensors header is not valid JSON (" + path + "): " + err);
+        return false;
+    }
+    if (!root.is<picojson::object>()) {
+        GLM_LOG_ERROR("safetensors header must be a JSON object (" + path + ")");
+        return false;
+    }
 
-        // Skip __metadata__ etc.
-        if (name.empty() || name[0] == '_') {
-            pos = nameEnd + 1;
+    const picojson::object& obj = root.get<picojson::object>();
+    for (const auto& [name, v] : obj) {
+        if (name.empty() || name[0] == '_') continue;  // __metadata__ etc.
+        ++stats_.total;
+        if (!v.is<picojson::object>()) {
+            ++stats_.rejected;
+            ++stats_.shapeRejected;  // malformed entry: no usable shape
             continue;
         }
+        const picojson::object& to = v.get<picojson::object>();
 
-        // Find next '{'
-        size_t objStart = header.find('{', nameEnd);
-        if (objStart == std::string::npos) break;
-        size_t objEnd = header.find('}', objStart);
-        if (objEnd == std::string::npos) break;
-        std::string obj = header.substr(objStart, objEnd - objStart + 1);
-
-        // Extract fields
         TensorInfo info;
         info.name = name;
 
         // dtype
-        size_t dp = obj.find("\"dtype\"");
-        if (dp != std::string::npos) {
-            size_t dq1 = obj.find('"', dp + 7);
-            size_t dq2 = obj.find('"', dq1 + 1);
-            info.dtype = obj.substr(dq1 + 1, dq2 - dq1 - 1);
+        auto dIt = to.find("dtype");
+        if (dIt != to.end() && dIt->second.is<std::string>()) {
+            info.dtype = dIt->second.get<std::string>();
         }
+        if (!dtypeByteSize(info.dtype)) {
+            ++stats_.rejected;
+            ++stats_.dtypeRejected;
+            continue;
+        }
+        if (opts.requireBf16 && info.dtype != "BF16") {
+            // Explicit F32 allow-list: GLM-5.2 legitimately stores the noaux_tc
+            // router score-correction bias as float32 (moe_router_dtype). F32
+            // still flows through shape/bounds/alignment/byte checks below.
+            if (info.dtype != "F32") {
+                ++stats_.rejected;
+                ++stats_.dtypeRejected;
+                continue;
+            }
+            bool f32Allowed = false;
+            for (const auto& frag : opts.allowF32NameContaining) {
+                if (name.find(frag) != std::string::npos) { f32Allowed = true; break; }
+            }
+            if (!f32Allowed) {
+                ++stats_.rejected;
+                ++stats_.dtypeRejected;
+                continue;
+            }
+            ++stats_.f32AllowedAccepted;
+        }
+        const size_t dtypeBytes = dtypeByteSize(info.dtype);
 
         // shape
-        size_t sp = obj.find("\"shape\"");
-        if (sp != std::string::npos) {
-            info.shape = parseIntArray(obj, sp);
-        }
-
-        // data_offsets
-        size_t dop = obj.find("\"data_offsets\"");
-        if (dop != std::string::npos) {
-            size_t arr = obj.find('[', dop);
-            size_t comma = obj.find(',', arr);
-            size_t close = obj.find(']', arr);
-            try {
-                info.dataBegin = std::stoull(obj.substr(arr + 1, comma - arr - 1));
-                info.dataEnd = std::stoull(obj.substr(comma + 1, close - comma - 1));
-            } catch (...) {}
-        }
-
-        if (info.dataEnd > info.dataBegin) {
-            // Bounds validation: the tensor must live entirely inside the file.
-            bool inFile = (headerSize_ + info.dataEnd <= fileSize_);
-            // dtype validation: unknown dtypes are skipped (cannot trust byte layout).
-            bool knownType = isKnownDtype(info.dtype);
-            // shape validation: non-empty, non-negative dims.
-            bool validShape = !info.shape.empty();
-            for (int s : info.shape) {
-                if (s < 0) validShape = false;
+        auto sIt = to.find("shape");
+        size_t numel = 1;
+        bool okShape = false;
+        if (sIt != to.end() && sIt->second.is<picojson::array>()) {
+            okShape = true;
+            for (const auto& dim : sIt->second.get<picojson::array>()) {
+                if (!dim.is<double>()) { okShape = false; break; }
+                double dv = dim.get<double>();
+                if (dv < 0.0 || dv != std::floor(dv)) { okShape = false; break; }
+                int d = int(dv);
+                if (d > (1 << 30)) { okShape = false; break; }  // numel overflow guard
+                info.shape.push_back(d);
+                numel *= size_t(d);
             }
-            if (inFile && knownType && validShape) {
-                tensors_[name] = info;
-            } else {
-                GLM_LOG_WARN("safetensors: skipping tensor '" + name + "' (inFile=" +
-                             std::to_string(inFile) + ", dtype=" + info.dtype +
-                             ", shape=" + std::to_string(info.shape.size()) + " dims)");
+            if (okShape && info.shape.empty()) okShape = false;
+        }
+        if (!okShape) {
+            ++stats_.rejected;
+            ++stats_.shapeRejected;
+            continue;
+        }
+
+        // data_offsets: exactly [begin, end], begin < end (non-empty tensor)
+        bool okOffsets = false;
+        auto oIt = to.find("data_offsets");
+        if (oIt != to.end() && oIt->second.is<picojson::array>()) {
+            const auto& arr = oIt->second.get<picojson::array>();
+            if (arr.size() == 2 && arr[0].is<double>() && arr[1].is<double>()) {
+                info.dataBegin = uint64_t(arr[0].get<double>());
+                info.dataEnd = uint64_t(arr[1].get<double>());
+                okOffsets = (info.dataEnd > info.dataBegin);
             }
         }
+        if (!okOffsets) {
+            ++stats_.rejected;
+            ++stats_.boundsRejected;
+            continue;
+        }
 
-        pos = objEnd + 1;
+        // Bounds: the tensor must live entirely inside the file.
+        if (headerSize_ + info.dataEnd > fileSize_) {
+            ++stats_.rejected;
+            ++stats_.boundsRejected;
+            continue;
+        }
+
+        // Tensor data alignment (item 7): absolute start offset must be
+        // 8-byte aligned for unaligned-SIMD-safe zero-copy weight views.
+        if (opts.requireAlignedData && ((headerSize_ + info.dataBegin) % 8) != 0) {
+            ++stats_.rejected;
+            ++stats_.alignmentRejected;
+            continue;
+        }
+
+        // Shape x dtype byte consistency: catches header corruption that a pure
+        // bounds check cannot see (e.g. shape/dtype/offset edited inconsistently).
+        if (numel * dtypeBytes != info.byteSize()) {
+            ++stats_.rejected;
+            ++stats_.byteMismatchRejected;
+            continue;
+        }
+
+        // Duplicate tensor names: reject the second occurrence (never silently
+        // overwrite; a duplicate is corruption per the safetensors contract).
+        if (tensors_.count(name) != 0) {
+            ++stats_.rejected;
+            ++stats_.duplicateRejected;
+            continue;
+        }
+
+        tensors_[name] = info;
+        ++stats_.accepted;
     }
 
     // Close file stream (no longer needed once mmap is opened)
@@ -160,7 +233,17 @@ bool SafeTensorsFile::open(const std::string& path) {
         mmap_.reset();
     }
 
-    GLM_LOG_INFO("safetensors parsed: " + path + " (" + std::to_string(tensors_.size()) + " tensors)");
+    GLM_LOG_INFO("safetensors parsed: " + path + " (" + std::to_string(tensors_.size()) +
+                 " of " + std::to_string(stats_.total) + " tensors accepted)");
+    if (stats_.rejected > 0) {
+        GLM_LOG_WARN("safetensors rejections (" + path + "): duplicate=" +
+                     std::to_string(stats_.duplicateRejected) + " dtype=" +
+                     std::to_string(stats_.dtypeRejected) + " shape=" +
+                     std::to_string(stats_.shapeRejected) + " bounds=" +
+                     std::to_string(stats_.boundsRejected) + " byte-mismatch=" +
+                     std::to_string(stats_.byteMismatchRejected) + " unaligned-data=" +
+                     std::to_string(stats_.alignmentRejected));
+    }
     return true;
 }
 

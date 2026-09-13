@@ -83,6 +83,20 @@ struct WeightIndex {
     TensorLocation lmHead;               // [vocab, hidden] (independent when tie_word_embeddings=false)
     TensorLocation finalNorm;            // [hidden] model.norm.weight
 
+    // MTP (_model.nextn_predict_layers.<i>.*_ / _mtp_layers.<i>._ prefix scan).
+    // No MTP-bearing checkpoint is available in this environment (GLM-5.2-bf16
+    // config curs `num_nextn_predict_layers: 1` but ships zero MTP tensors), so
+    // the index records presence/count only and main.cpp gates --mtp on them.
+    bool hasMtpTensors = false;          // any nextn_predict_layers.* / mtp_layers.* tensor
+    bool hasMtpHead = false;             // nextn_predict_head* / mtp_head* present
+    int mtpTensorLayers = 0;             // distinct MTP layer indices discovered
+
+    // Largest "model.layers.<i>.*" group index seen. GLM-5.2 ships a DSA
+    // root/corpus-embedding group at index num_hidden_layers (eh_proj/enorm/
+    // hnorm + full decoder block) that is not a decoder layer the engine runs;
+    // --check-weights surfaces it as information rather than failing.
+    int maxSeenBaseLayer = 0;
+
     // List of all shard files
     std::vector<std::string> shardFiles;
 

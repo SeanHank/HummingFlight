@@ -51,6 +51,28 @@ public:
     // the predicted experts for layer L+1 (lookahead).
     void onLayerRouterDone(int layer, const std::vector<int>& topKExperts);
 
+    // Router-probability aware variant (new overload; the 2-arg overload
+    // delegates with empty probabilities). `probs` holds the router weights of
+    // the elected experts (same order/length as topKExperts). Enables #14:
+    // speculative extra prefetch (`prefetchExtraDepth`), probability-weighted
+    // residency pins and per-layer probability tracking.
+    void onLayerRouterDone(int layer, const std::vector<int>& topKExperts,
+                           const std::vector<float>& probs);
+
+    // Configure the router-probability upgrades. prefetchExtraDepth > 0 enables
+    // speculative extra experts per layer; probPriority promotes experts whose
+    // router probability is ~max for their layer to residency pins.
+    void setRouterPrefetch(int prefetchExtraDepth, bool probPriority);
+
+    // Configure the EMA popularity predictor (#4): keeps an exponential moving
+    // average of each expert's routing heat (sum of probabilities per routing
+    // event, or 1.0 when probabilities are unavailable). With `enable` the
+    // lookahead predictor falls back to the top-N hottest experts of the next
+    // layer, and the hottest expert of each routed layer gets an LRU soft-boost
+    // (#14). `alpha` in (0,1] is the EMA window; <= 0 means 0.1. Off by default
+    // (goldens preserved).
+    void setPopularityPredictor(float alpha, bool enable);
+
     // Load expert weights: LRU cache first, batched IOCP fallback, sync read
     // last. Returns true on success, writes to destBuffer.
     bool loadExpert(int layer, int expertId, void* destBuffer, size_t bufSize);
@@ -94,6 +116,25 @@ private:
     // Previous token's Top-K per layer (prediction basis).
     std::vector<std::vector<int>> lastTopK_;
 
+    // Router probabilities of the previous token per layer (same order).
+    std::vector<std::vector<std::pair<int, float>>> lastTopKProbs_;
+
+    // Router-probability upgrade knobs (#14/#13). Off by default so byte-for-byte
+    // golden outputs are preserved.
+    int prefetchExtraDepth_ = 0;
+    bool probPriority_ = false;
+    std::vector<float> layerMaxProb_;
+
+    // EMA popularity predictor (#4, opt-in). heat(key) = alpha*p + (1-alpha)*heat.
+    bool emaPredictor_ = false;
+    float emaAlpha_ = 0.1f;
+    std::unordered_map<ExpertKey, float, ExpertKeyHash> emaHeat_;
+
+    // Step counter for expert reuse-distance telemetry (incremented once per
+    // onLayerRouterDone call = one routing event).
+    uint64_t routingStep_ = 0;
+    std::unordered_map<ExpertKey, uint64_t, ExpertKeyHash> lastUseStep_;
+
     // Compute-side staging buffers. getExpertPtr/getSharedProjectionPtr return
     // pointers into these; contents are copied from the LRU/disk under lock so
     // eviction by prefetch workers can never invalidate in-use memory.
@@ -103,6 +144,9 @@ private:
     // Keys currently in flight (guarded; touched by IOCP workers and the caller).
     std::mutex inFlightMtx_;
     std::unordered_set<ExpertKey, ExpertKeyHash> prefetchedInFlight_;
+
+    // Record a routing event for reuse-distance / LRU telemetry (expert consumed).
+    void noteRoutingUse(int layer, int expertId);
 };
 
 } // namespace glm

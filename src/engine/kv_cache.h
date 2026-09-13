@@ -20,6 +20,15 @@ namespace glm {
 // mirroring the reference expanded layout (previously a compressed-latent cache
 // was used; the reference materialized expanded K/V and so do we).
 //
+// HEAD-MAJOR STORAGE (item 3: decode KV construction cost). Key/value buffers
+// are laid out [numHeads][maxSeqLen][headDim] so a head's history across the
+// selected DSA positions is a single contiguous run of cache lines:
+//   index(h, t, d) = h * (maxSeqLen * headDim) + t * headDim + d
+// The hot sparse-attention inner loop therefore walks selected positions
+// sequentially per head instead of leaping a full token stride per position
+// (token-major layout caused one 17 KB jump per selected position). Values are
+// unchanged numerically - this is a pure memory-layout change.
+//
 // Buffers grow dynamically (growTo) instead of preallocating the worst case.
 
 class KVCache {
@@ -30,6 +39,11 @@ public:
     void init(int numLayers, int numHeads, int qkHeadDim, int vHeadDim,
               int indexHeadDim, int maxSeqLen = 4096);
 
+    // Grow-only reserve for a known horizon (prompt + decode budget) so the
+    // per-token append path never reallocates mid-run (item: KV decode-cost
+    // reduction). No-op when the current capacity already covers tokenCount.
+    void reserve(int tokenCount);
+
     // Append current token's expanded key / value / indexer key at an explicit
     // token position. key: [numHeads*qkHeadDim], value: [numHeads*vHeadDim],
     // indexKey: [indexHeadDim].
@@ -37,9 +51,12 @@ public:
     void appendValue(int layer, int tokenPos, const float* value);
     void appendIndexKey(int layer, int tokenPos, const float* indexKey);
 
-    // Get pointer to cached data for token t at layer l (t < maxSeqLen).
-    const float* getKey(int layer, int tokenPos) const;
-    const float* getValue(int layer, int tokenPos) const;
+    // Get pointer to cached data for head h / token t at layer l (head-major:
+    // head h's token history is contiguous, so sparse attention reads cache
+    // lines sequentially across the selected positions). Returns nullptr on
+    // out-of-range.
+    const float* getKey(int layer, int head, int tokenPos) const;
+    const float* getValue(int layer, int head, int tokenPos) const;
     const float* getIndexKey(int layer, int tokenPos) const;
 
     // Advance sequence length by one (call once per token after all layers appended).
@@ -59,9 +76,10 @@ public:
 
 private:
     struct LayerBuffer {
-        std::vector<float> key;      // contiguous [maxSeqLen * numHeads * qkHeadDim]
-        std::vector<float> value;    // contiguous [maxSeqLen * numHeads * vHeadDim]
-        std::vector<float> indexKey; // contiguous [maxSeqLen * indexHeadDim]
+        // Head-major [numHeads * maxSeqLen * headDim] float buffers.
+        std::vector<float> key;      // [h][t][d], headDim = qkHeadDim
+        std::vector<float> value;    // [h][t][d], headDim = vHeadDim
+        std::vector<float> indexKey; // token-major [maxSeqLen * indexHeadDim]
     };
 
     int numLayers_ = 0;
@@ -72,8 +90,9 @@ private:
     int maxSeqLen_ = 0;
     int seqLen_ = 0;
 
-    int layerKeyStride_ = 0;
-    int layerValueStride_ = 0;
+    // Head-h block stride inside a head-major key/value buffer (floats):
+    // maxSeqLen * headDim. Used to rebase offsets when the buffer grows.
+    size_t headStride_ = 0;
     int layerIndexStride_ = 0;
 
     std::vector<LayerBuffer> layerBuffers_;

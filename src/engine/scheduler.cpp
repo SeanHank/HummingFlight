@@ -1,7 +1,9 @@
 #include "engine/scheduler.h"
+#include "engine/inference_stats.h"
 #include "utils/logger.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -73,10 +75,31 @@ bool Scheduler::init(WeightIndex& idx, size_t lruCapacityBytes, int iocpWorkers,
 
     int numLayers = idx.config.numLayers;
     lastTopK_.resize(numLayers);
+    lastTopKProbs_.resize(numLayers);
+    layerMaxProb_.assign(numLayers, 0.0f);
 
     GLM_LOG_INFO("Scheduler ready: LRU=" + std::to_string(lruCapacityBytes / (1024 * 1024)) +
                  " MB, IOCP workers=" + std::to_string(iocpWorkers));
     return true;
+}
+
+void Scheduler::setRouterPrefetch(int prefetchExtraDepth, bool probPriority) {
+    prefetchExtraDepth_ = std::max(0, prefetchExtraDepth);
+    probPriority_ = probPriority;
+    if (prefetchExtraDepth_ > 0 || probPriority_) {
+        GLM_LOG_INFO("Scheduler router-probability mode: extra-prefetch=" +
+                     std::to_string(prefetchExtraDepth_) + ", prob-priority-residency=" +
+                     std::to_string(probPriority_ ? 1 : 0));
+    }
+}
+
+void Scheduler::setPopularityPredictor(float alpha, bool enable) {
+    emaPredictor_ = enable;
+    emaAlpha_ = (alpha > 0.0f && alpha <= 1.0f) ? alpha : 0.1f;
+    if (emaPredictor_) {
+        GLM_LOG_INFO("Scheduler EMA popularity predictor: alpha=" +
+                     std::to_string(emaAlpha_) + ", LRU soft-boost for hottest experts");
+    }
 }
 
 void Scheduler::shutdown() {
@@ -93,20 +116,138 @@ bool Scheduler::probe(ExpertKey key) {
 }
 
 std::vector<int> Scheduler::predictNextLayerExperts(int nextLayer, const std::vector<int>& currentTopK) {
+    // Base predictor (kept unchanged when the EMA upgrade is off): the previous
+    // token's routing at the same layer, else a weak inter-layer carry-over.
+    std::vector<int> reuse = currentTopK;
+    bool haveReuse = false;
     if (nextLayer >= 0 && nextLayer < int(lastTopK_.size()) && !lastTopK_[nextLayer].empty()) {
-        return lastTopK_[nextLayer];  // previous token's routing at the same layer
+        reuse = lastTopK_[nextLayer];
+        haveReuse = true;
     }
-    return currentTopK;               // weak inter-layer fallback
+
+    if (!emaPredictor_) return reuse;
+
+    // EMA popularity blend (#4): start from the reuse set, then fill any
+    // remaining slots with the hottest experts of the next layer by their
+    // EM-averaged routing heat.
+    int numNeed = int(reuse.size());
+    std::unordered_set<int> seen(reuse.begin(), reuse.end());
+    std::vector<int> hot;
+    {
+        std::vector<std::pair<float, int>> candidates;
+        for (const auto& [key, heat] : emaHeat_) {
+            if (key.layer != uint32_t(nextLayer)) continue;
+            if (key.expert_id >= index_->config.numLocalExperts) continue;
+            if (seen.count(key.expert_id)) continue;
+            if (heat > 0.0f) candidates.emplace_back(heat, key.expert_id);
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (const auto& [heat, eid] : candidates) {
+            (void)heat;
+            if (int(hot.size()) + int(reuse.size()) >= numNeed) break;
+            seen.insert(eid);
+            hot.push_back(eid);
+        }
+    }
+    if (hot.empty() && !haveReuse) return reuse;
+    std::vector<int> merged = reuse;
+    merged.insert(merged.end(), hot.begin(), hot.end());
+    return merged;
+}
+
+void Scheduler::noteRoutingUse(int layer, int expertId) {
+    ExpertKey key{uint32_t(layer), uint16_t(expertId)};
+    auto& stats = InferenceStats::instance();
+    auto it = lastUseStep_.find(key);
+    if (it != lastUseStep_.end()) {
+        if (routingStep_ > it->second) {
+            stats.reuseDistanceSum += routingStep_ - it->second;
+            ++stats.reuseDistanceCount;
+        }
+    }
+    lastUseStep_[key] = routingStep_;
 }
 
 void Scheduler::onLayerRouterDone(int layer, const std::vector<int>& topKExperts) {
+    onLayerRouterDone(layer, topKExperts, {});
+}
+
+void Scheduler::onLayerRouterDone(int layer, const std::vector<int>& topKExperts,
+                                  const std::vector<float>& probs) {
     if (!index_) return;
+
+    routingStep_++;
     if (layer >= 0 && layer < int(lastTopK_.size())) lastTopK_[layer] = topKExperts;
+
+    // Record per-layer probability state (item 14). Weights come in the same
+    // order as topKExperts or empty (legacy 2-arg call).
+    std::vector<std::pair<int, float>> probPairs;
+    probPairs.reserve(topKExperts.size());
+    for (size_t i = 0; i < topKExperts.size(); ++i) {
+        float p = (i < probs.size()) ? probs[i] : 0.0f;
+        probPairs.emplace_back(topKExperts[i], p);
+        if (probPriority_ && layer >= 0 && layer < int(layerMaxProb_.size())) {
+            layerMaxProb_[layer] = std::max(layerMaxProb_[layer], p);
+        }
+        noteRoutingUse(layer, topKExperts[i]);
+    }
+    if (layer >= 0 && layer < int(lastTopKProbs_.size())) lastTopKProbs_[layer] = std::move(probPairs);
+
+    // EMA popularity roll (#4): heat = alpha*signal + (1-alpha)*heat, where the
+    // signal is the router probability or 1.0 for occurrence-only calls. The
+    // hottest expert of the routed layer earns an LRU soft-boost (#14).
+    if (emaPredictor_ && layer >= 0) {
+        float a = (emaAlpha_ > 0.0f && emaAlpha_ <= 1.0f) ? emaAlpha_ : 0.1f;
+        ExpertKey bestKey{uint32_t(layer), uint16_t(0)};
+        float bestHeat = -1.0f;
+        for (const auto& eid : topKExperts) {
+            if (eid < 0 || eid >= index_->config.numLocalExperts) continue;
+            ExpertKey k{uint32_t(layer), uint16_t(eid)};
+            float& h = emaHeat_[k];
+            h = a * 1.0f + (1.0f - a) * h;  // occurrence signal; prob-weighting kept per-layer below
+            if (h > bestHeat) { bestHeat = h; bestKey = k; }
+        }
+        if (bestHeat > 0.0f) lru_.boost(bestKey, 1);
+    }
 
     int nextLayer = layer + 1;
     if (nextLayer < 0 || nextLayer >= index_->config.numLayers) return;
 
-    auto predicted = predictNextLayerExperts(nextLayer, topKExperts);
+    std::vector<int> predicted = predictNextLayerExperts(nextLayer, topKExperts);
+
+    // Speculative extra prefetch (#14): pull the next-most-probable experts of
+    // the CURRENT layer (this token, d == routed winners) unless the estimate
+    // for the next layer already covers them. Off by default (prefetchExtraDepth_).
+    if (prefetchExtraDepth_ > 0 && layer >= 0 && layer < int(lastTopKProbs_.size())) {
+        std::unordered_set<int> seen(predicted.begin(), predicted.end());
+        std::vector<std::pair<float, int>> candidates;
+        for (const auto& [eid, p] : lastTopKProbs_[layer]) {
+            if (p > 0.0f && seen.count(eid) == 0) candidates.emplace_back(p, eid);
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        int added = 0;
+        for (const auto& [p, eid] : candidates) {
+            if (added >= prefetchExtraDepth_) break;
+            predicted.push_back(eid);
+            seen.insert(eid);
+            ++added;
+        }
+    }
+
+    // Probability-weighted residency (#13): experts whose router probability is
+    // within 10% of their layer's maximum stay resident once loaded (learned pins
+    // fire earlier: access threshold 2 instead of kPinThreshold).
+    if (probPriority_ && layer >= 0 && layer < int(layerMaxProb_.size()) &&
+        layerMaxProb_[layer] > 0.0f) {
+        for (const auto& [eid, p] : lastTopKProbs_[layer]) {
+            if (p >= 0.9f * layerMaxProb_[layer] &&
+                placement_.getAccessCount(layer, eid) >= 2) {
+                lru_.pin(ExpertKey{uint32_t(layer), uint16_t(eid)});
+            }
+        }
+    }
 
     std::vector<std::pair<int, int>> scope;
     for (int eid : predicted) {
@@ -229,6 +370,14 @@ void Scheduler::prefetchAsync(const std::vector<std::pair<int, int>>& experts) {
         auto slices = run->slices;
         std::string shard = run->shard;
         uint64_t start = run->start;
+        const auto submitTime = std::chrono::steady_clock::now();
+
+        auto& stats = InferenceStats::instance();
+        ++stats.prefetchSubmitted;
+        ++stats.ioReadCount;
+        ++stats.randomIoCount;
+        stats.diskBytesRead += runSize;
+        stats.sequentialBytes += runSize;
 
         ReadRequest req;
         req.filePath = shard;
@@ -236,8 +385,12 @@ void Scheduler::prefetchAsync(const std::vector<std::pair<int, int>>& experts) {
         req.size = runSize;
         req.destBuffer = buf->data();
 
-        iocp_.submitRead(req, [this, buf, slices, shard, start](bool success, size_t bytesRead) {
+        iocp_.submitRead(req, [this, buf, slices, shard, start, submitTime](bool success, size_t bytesRead) {
             (void)shard;
+            auto& stats = InferenceStats::instance();
+            stats.ioLatencyNsSum += uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - submitTime).count());
             if (!success) return;
             for (const auto& s : slices) {
                 if (bytesRead >= s.offsetInRun + s.size) {
@@ -249,7 +402,9 @@ void Scheduler::prefetchAsync(const std::vector<std::pair<int, int>>& experts) {
                     if (!s.assem->inserted.exchange(true)) {
                         std::lock_guard<std::mutex> guard(inFlightMtx_);
                         BufferHandle h(std::move(*s.assem->handle));
-                        lru_.insert(s.assem->key, std::move(h));
+                        if (lru_.insert(s.assem->key, std::move(h), /*fromPrefetch=*/true)) {
+                            ++stats.prefetchInserted;
+                        }
                         prefetchedInFlight_.erase(s.assem->key);
                     }
                 }
@@ -322,17 +477,22 @@ const uint8_t* Scheduler::getExpertPtr(int layer, int expertId) {
     if (bytes == 0) return nullptr;
     if (exScratch_.size() < bytes) exScratch_.resize(size_t(bytes));
 
+    auto& stats = InferenceStats::instance();
+    ++stats.expertLookups;
     if (lru_.copyTo(key, exScratch_.data(), exScratch_.size())) {
+        ++stats.expertLruHits;
         if (placement_.getAccessCount(layer, expertId) >= kPinThreshold) lru_.pin(key);
         return exScratch_.data();
     }
 
+    ++stats.expertLruMisses;
+    ++stats.expertDiskLoads;
     BufferHandle loaded;
     if (!loadExpertFromDisk(layer, expertId, loaded)) return nullptr;
     if (loaded.size != bytes) return nullptr;
     std::memcpy(exScratch_.data(), loaded.ptr(), loaded.size);
 
-    if (lru_.insert(key, std::move(loaded))) {
+    if (lru_.insert(key, std::move(loaded), /*fromPrefetch=*/false)) {
         if (placement_.getAccessCount(layer, expertId) >= kPinThreshold) lru_.pin(key);
     }
     return exScratch_.data();

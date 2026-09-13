@@ -28,6 +28,47 @@ from common import (
 )
 
 SPEED_RE = re.compile(r"Speed:\s*([\d.]+)\s*tok/s", re.IGNORECASE)
+STATS_RE = re.compile(r"STATS:\s*(\{.*\})", re.DOTALL)
+
+# I/O & cache telemetry rows rendered from the engine's `STATS:` JSON line.
+# Each entry: (report label, stats key, formatter, unit suffix)
+def _num(v) -> str:
+    return f"{float(v):.4f}".rstrip("0").rstrip(".")
+
+
+def _human_bytes(v) -> str:
+    value = float(v)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024.0 or unit == "TiB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} TiB"
+
+
+def _pct(v) -> str:
+    return f"{float(v) * 100.0:.2f}%"
+
+
+TELEMETRY_ROWS = (
+    ("CPU utilization", "cpu_utilization", _num, ""),
+    ("GPU utilization (expert stream)", "gpu_utilization", _pct, ""),
+    ("PCIe utilization", "pcie_utilization", _pct, ""),
+    ("Expert LRU hit rate", "expert_cache_hit_rate", _pct, ""),
+    ("Expert LRU misses", "expert_lru_misses", lambda v: f"{int(float(v))}", ""),
+    ("Expert disk (sync) loads", "expert_disk_loads", lambda v: f"{int(float(v))}", ""),
+    ("Prefetch delivery rate", "prefetch_delivery_rate", _pct, ""),
+    ("Prefetch waste rate", "prefetch_waste_rate", _pct, ""),
+    ("Random I/O runs", "random_io_count", lambda v: f"{int(float(v))}", ""),
+    ("I/O read requests", "io_read_count", lambda v: f"{int(float(v))}", ""),
+    ("Disk bytes read", "disk_bytes_read", _human_bytes, ""),
+    ("Sequential bytes", "sequential_bytes", _human_bytes, ""),
+    ("Bytes / token (decode)", "bytes_read_per_token", lambda v: f"{float(v):.1f}", "B"),
+    ("Sequential bytes / token (decode)", "sequential_bytes_per_token", lambda v: f"{float(v):.1f}", "B"),
+    ("HDD latency (avg)", "hdd_latency_ms", _num, "ms"),
+    ("RAM bandwidth (compute)", "ram_bandwidth_mbps", lambda v: f"{float(v):.1f}", "MB/s"),
+    ("PCIe transfer", "pcie_transfer_gbps", lambda v: f"{float(v):.3f}", "GB/s"),
+    ("Expert reuse distance", "expert_reuse_distance_tok", lambda v: f"{float(v):.1f}", "tok"),
+)
 
 
 def run_engine(args: argparse.Namespace, model_dir: str) -> tuple[int, str]:
@@ -59,7 +100,22 @@ def parse_metrics(output: str) -> dict:
     speed = SPEED_RE.search(output)
     if speed:
         metrics["speed_tok_per_s"] = float(speed.group(1))
+    stats = parse_stats(output)
+    if stats:
+        metrics["telemetry"] = stats
     return metrics
+
+
+def parse_stats(output: str) -> dict | None:
+    """Parse the engine's flat `STATS: {...}` telemetry JSON line."""
+    m = STATS_RE.search(output)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def main() -> int:
@@ -100,6 +156,22 @@ def main() -> int:
         if key in metrics:
             report.row([key, f"{metrics[key]} {unit}".strip()])
     report.text("")
+
+    telemetry = metrics.get("telemetry")
+    if telemetry:
+        report.section("Engine telemetry (I/O & cache)")
+        report.table(["Metric", "Value"])
+        rows_added = 0
+        for label, key, fmt, unit in TELEMETRY_ROWS:
+            if key in telemetry:
+                value = fmt(telemetry[key])
+                report.row([label, f"{value} {unit}".strip()] if unit else [label, value])
+                rows_added += 1
+        if rows_added < len(TELEMETRY_ROWS):
+            report.text("")
+            report.text("_Note: benchmark sampled only a subset of telemetry rows._")
+        report.text("")
+
     report.text(out[-1200:])
     report.section("L4 gate decision")
     if code != 0:

@@ -46,6 +46,24 @@ def test_usage_lists_new_flags() -> None:
     assert "--self-test" in combined
     assert "--version" in combined
     assert "--check-weights" in combined
+    assert "--typical-p" in combined
+    assert "--frequency-penalty" in combined
+    assert "--presence-penalty" in combined
+    assert "--predictor ema" in combined
+    assert "--gpu-expert-depth" in combined
+
+
+def test_unavailable_optins_fail_loudly() -> None:
+    # Item 15: requesting an unavailable opt-in feature is a hard error, never a
+    # silent degradation. Approaches that historically degraded quietly:
+    #   --mtp  -> refused (no MTP head / no MTP weights must not silently sample
+    #             from the base LM head)
+    #   --gpu-experts 1 -> refused on a CUDA-less build instead of falling back
+    #             to CPU expert FFN
+    # Both must exit non-zero (and never with returncode 0 + a quiet fallback).
+    for args in (["--mtp"], ["--gpu-experts", "1"], ["--gpu-expert-depth", "2", "--gpu-experts", "1"]):
+        proc = _run(*args, "--model", "NONEXISTENT_DIR")
+        assert proc.returncode != 0, args
 
 
 def test_functional_selftest_binary_passes() -> None:

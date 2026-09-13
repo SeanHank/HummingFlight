@@ -37,6 +37,10 @@ Prerequisites (Windows 10/11 x64, or macOS 14+, or Ubuntu):
 | Python | 3.10+ with `transformers` and `jinja2` for the tokenizer bridge |
 | Model | optional — `E:\glm-5.2-bf16` or any GLM-5.2 BF16 checkpoint for L2–L5 |
 
+All runtime C++ dependencies are vendored under `third_party/` (currently the
+header-only BSD JSON parser `picojson.h`); there is no network fetch at build
+time.
+
 Build and run the full test stack:
 
 ```powershell

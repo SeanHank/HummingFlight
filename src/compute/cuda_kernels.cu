@@ -121,6 +121,37 @@ __global__ void argmaxKernel(const float* x, int n, int* best) {
     if (tid == 0) best[0] = sindex[0];
 }
 
+// Silu + elementwise multiply (in place on act): act[i] = silu(act[i]) * up[i].
+__global__ void siluScaleKernel(float* act, const float* up, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = act[i];
+    act[i] = (g / (1.0f + __expf(-g))) * up[i];
+}
+
+// matvecKernel on an explicit stream (stream-safe variant).
+__global__ void matvecStreamKernel(const unsigned short* W, const float* x, float* y,
+                                   int M, int K) {
+    __shared__ float partial[256];
+    int row = blockIdx.x;
+    if (row >= M) return;
+    int tid = threadIdx.x;
+
+    float acc = 0.0f;
+    for (int k = tid; k < K; k += blockDim.x) {
+        acc += bf16ToF32(W[(size_t)row * K + k]) * x[k];
+    }
+    partial[tid] = acc;
+    __syncthreads();
+    int stride = blockDim.x >> 1;
+    while (stride > 0) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+        stride >>= 1;
+    }
+    if (tid == 0) y[row] = partial[0];
+}
+
 } // namespace
 
 // ---------- Device helpers with failure reporting ----------
@@ -147,6 +178,21 @@ bool softmax(float* d_x, int n) {
 
 bool argmax(const float* d_x, int n, int* d_best) {
     argmaxKernel<<<1, 256>>>(d_x, n, d_best);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool expertFfn(const unsigned short* d_gateW, const unsigned short* d_upW,
+               const unsigned short* d_downW, const float* d_x, float* d_out,
+               float* d_act, float* d_up, int hidden, int inter,
+               cudaStream_t stream) {
+    // out = down @ (silu(x @ gate^T) .* (x @ up^T))
+    matvecStreamKernel<<<inter, 256, 0, stream>>>(d_gateW, d_x, d_act, inter, hidden);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    matvecStreamKernel<<<inter, 256, 0, stream>>>(d_upW, d_x, d_up, inter, hidden);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    siluScaleKernel<<<(inter + 255) / 256, 256, 0, stream>>>(d_act, d_up, inter);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    matvecStreamKernel<<<hidden, 256, 0, stream>>>(d_downW, d_act, d_out, hidden, inter);
     return cudaGetLastError() == cudaSuccess;
 }
 

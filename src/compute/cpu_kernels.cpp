@@ -1,4 +1,5 @@
 #include "compute/cpu_kernels.h"
+#include "engine/inference_stats.h"
 #include "utils/logger.h"
 #include <cmath>
 #include <thread>
@@ -21,14 +22,30 @@
 
 namespace glm {
 
+// Helper: convert 8 BF16 (128-bit) to a __m256 of F32 (zero-extend + shift).
+#if defined(_MSC_VER) || defined(__SSE2__)
+static inline __m256 bf16x8toF32(const BFloat16* p) {
+    __m128i bf16_bits = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    __m256i u32_bits = _mm256_cvtepu16_epi32(bf16_bits);
+    __m256i f32_bits = _mm256_slli_epi32(u32_bits, 16);
+    return _mm256_castsi256_ps(f32_bits);
+}
+#endif
+
 // ---------- AVX2 BF16 GEMV kernel ----------
 // y = alpha * A @ x + beta * y
 // A: [M, K] row-major BF16, x: [K] F32, y: [M] F32
-// R7-5800H supports AVX2 + FMA, processes 8 BF16 -> 8 F32 -> FMA dot product at a time
+// R7-5800H supports AVX2 + FMA, processes 16 BF16 -> 16 F32 -> 2 FMA ops per
+// loop iteration (two independent 8-wide lanes into ONE accumulator so the
+// per-lane accumulation order—and therefore the fp32 result—is bit-identical
+// to the previous single-8-wide loop, only with more instruction-level
+// parallelism to hide FMA latency).
 void gemv_bf16_f32(const BFloat16* A, const float* x, float* y,
                    int M, int K, float alpha, float beta) {
+    auto& stats = InferenceStats::instance();
+    stats.ramBytesMoved += uint64_t(M) * uint64_t(K) * 2 + uint64_t(K) * 4 + uint64_t(M) * 4;
 #ifdef _MSC_VER
-    // AVX2 implementation: process 8 BF16 elements at a time
+    // AVX2 implementation: process 8 BF16 elements per lane, 16 per iteration.
     const int K8 = K & ~7;  // Round K down to a multiple of 8
 
     #pragma omp parallel for schedule(static)
@@ -36,20 +53,14 @@ void gemv_bf16_f32(const BFloat16* A, const float* x, float* y,
         const BFloat16* row = A + int64_t(i) * K;
         __m256 sum = _mm256_setzero_ps();
 
-        // Main loop: 8 BF16 at a time
+        // Main loop: 16 BF16 (two 8-wide FMA groups) at a time.
         int j = 0;
+        for (; j + 8 < K8; j += 16) {
+            sum = _mm256_fmadd_ps(bf16x8toF32(row + j), _mm256_loadu_ps(x + j), sum);
+            sum = _mm256_fmadd_ps(bf16x8toF32(row + j + 8), _mm256_loadu_ps(x + j + 8), sum);
+        }
         for (; j < K8; j += 8) {
-            // Load 8 BF16 (uint16) -> __m128i
-            __m128i bf16_bits = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + j));
-            // Zero-extend to 32 bits: uint16 -> uint32
-            __m256i u32_bits = _mm256_cvtepu16_epi32(bf16_bits);
-            // Left shift by 16 bits to get F32 bit pattern
-            __m256i f32_bits = _mm256_slli_epi32(u32_bits, 16);
-            __m256 a_f32 = _mm256_castsi256_ps(f32_bits);
-            // Load 8 F32 from x
-            __m256 x_f32 = _mm256_loadu_ps(x + j);
-            // FMA: sum += a * x
-            sum = _mm256_fmadd_ps(a_f32, x_f32, sum);
+            sum = _mm256_fmadd_ps(bf16x8toF32(row + j), _mm256_loadu_ps(x + j), sum);
         }
 
         // Horizontal sum
@@ -85,6 +96,8 @@ void gemv_bf16_f32(const BFloat16* A, const float* x, float* y,
 // ---------- GEMV: F32 matrix x F32 vector (AVX2 + OpenMP) ----------
 void gemv_f32(const float* A, const float* x, float* y,
               int M, int K, float alpha, float beta) {
+    auto& stats = InferenceStats::instance();
+    stats.ramBytesMoved += uint64_t(M) * uint64_t(K) * 4 + uint64_t(K) * 4 + uint64_t(M) * 4;
 #ifdef _MSC_VER
     const int K8 = K & ~7;
 
@@ -93,10 +106,12 @@ void gemv_f32(const float* A, const float* x, float* y,
         const float* row = A + int64_t(i) * K;
         __m256 sum = _mm256_setzero_ps();
         int j = 0;
+        for (; j + 8 < K8; j += 16) {
+            sum = _mm256_fmadd_ps(_mm256_loadu_ps(row + j), _mm256_loadu_ps(x + j), sum);
+            sum = _mm256_fmadd_ps(_mm256_loadu_ps(row + j + 8), _mm256_loadu_ps(x + j + 8), sum);
+        }
         for (; j < K8; j += 8) {
-            __m256 a = _mm256_loadu_ps(row + j);
-            __m256 xv = _mm256_loadu_ps(x + j);
-            sum = _mm256_fmadd_ps(a, xv, sum);
+            sum = _mm256_fmadd_ps(_mm256_loadu_ps(row + j), _mm256_loadu_ps(x + j), sum);
         }
         __m128 hi = _mm256_extractf128_ps(sum, 1);
         __m128 lo = _mm256_castps256_ps128(sum);

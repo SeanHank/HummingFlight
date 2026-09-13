@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -64,6 +65,7 @@ public:
             return nullptr;
         }
         ++hitCount_;
+        it->second.used = true;  // compute actually consumed this entry
         lruOrder_.splice(lruOrder_.begin(), lruOrder_, it->second.listIter);
         return &it->second.handle;
     }
@@ -79,6 +81,7 @@ public:
             return false;
         }
         ++hitCount_;
+        it->second.used = true;  // compute actually consumed this entry
         lruOrder_.splice(lruOrder_.begin(), lruOrder_, it->second.listIter);
         if (destSize < it->second.handle.size) return false;
         const uint8_t* src = static_cast<const uint8_t*>(it->second.handle.ptr());
@@ -88,7 +91,9 @@ public:
 
     // Insert (or replace) the entry for k. Returns false when the handle is too
     // large to ever fit or when every existing entry is pinned (bounded eviction).
-    bool insert(ExpertKey k, BufferHandle handle) {
+    // fromPrefetch marks entries that arrived via the lookahead pipeline so the
+    // wasted-prefetch counter can detect entries evicted before first use.
+    bool insert(ExpertKey k, BufferHandle handle, bool fromPrefetch = false) {
         std::lock_guard<std::mutex> lock(mtx_);
         size_t sz = handle.size;
         if (sz > capacity_) return false;
@@ -110,6 +115,8 @@ public:
 
         auto& entry = map_[k];
         entry.handle = std::move(handle);
+        entry.prefetched = fromPrefetch;
+        entry.used = false;
         lruOrder_.push_front(k);
         entry.listIter = lruOrder_.begin();
         used_ += sz;
@@ -121,6 +128,18 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(k);
         if (it != map_.end()) it->second.pinned = true;
+    }
+
+    // Soft-priority boost (item 14): promote to the front of the recency order
+    // and grant `protectCycles` eviction survivals. Unlike pin(), the entry is
+    // still evictable — the boost only makes it outlive `protectCycles` eviction
+    // sweeps. Shared/pinned entries are unaffected. No-op when not resident.
+    void boost(ExpertKey k, int protectCycles = 1) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = map_.find(k);
+        if (it == map_.end()) return;
+        it->second.protect = std::max(it->second.protect, protectCycles);
+        lruOrder_.splice(lruOrder_.begin(), lruOrder_, it->second.listIter);
     }
 
     bool contains(ExpertKey k) const {
@@ -135,6 +154,13 @@ public:
         return total == 0 ? 0.0 : double(hits) / double(total);
     }
 
+    // Number of prefetched entries evicted before the compute path ever touched
+    // them (wasted-prefetch telemetry). Sampled at report time.
+    size_t evictedPrefetchedUnused() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return evictedPrefetchedUnused_;
+    }
+
     size_t usedBytes() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return used_;
@@ -145,26 +171,36 @@ private:
     struct Entry {
         BufferHandle handle;
         bool pinned = false;
+        bool prefetched = false;  // inserted by the lookahead pipeline
+        bool used = false;        // consumed by the compute path at least once
+        int protect = 0;          // soft-priority eviction survivals (boost())
         std::list<ExpertKey>::iterator listIter;
     };
 
-    // Evict the least-recently-used NON-pinned entry. Returns true when an entry
-    // was evicted, false when only pinned entries remain.
+    // Evict the least-recently-used evictable entry: pinned entries are never
+    // evicted, softly-boosted entries survive the sweep n times (consuming one
+    // protection per sweep). Returns true when an entry was evicted, false when
+    // only protected/pinned entries remain.
     bool evictOne() {
         for (auto it = lruOrder_.rbegin(); it != lruOrder_.rend(); ++it) {
             auto& entry = map_[*it];
-            if (!entry.pinned) {
-                used_ -= entry.handle.size;
-                map_.erase(*it);
-                lruOrder_.erase(std::next(it).base());
-                return true;
+            if (entry.pinned) continue;
+            if (entry.protect > 0) {
+                --entry.protect;  // survive this sweep
+                continue;
             }
+            if (entry.prefetched && !entry.used) ++evictedPrefetchedUnused_;
+            used_ -= entry.handle.size;
+            map_.erase(*it);
+            lruOrder_.erase(std::next(it).base());
+            return true;
         }
         return false;
     }
 
     size_t capacity_;
     size_t used_;
+    size_t evictedPrefetchedUnused_ = 0;
     std::list<ExpertKey> lruOrder_;
     std::unordered_map<ExpertKey, Entry, ExpertKeyHash> map_;
     mutable std::mutex mtx_;

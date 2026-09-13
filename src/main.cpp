@@ -7,6 +7,7 @@
 #include "compute/cpu_kernels.h"
 #include "compute/cuda_backend.h"
 #include "compute/sampler.h"
+#include "engine/inference_stats.h"
 #include "engine/scheduler.h"
 #include "model/config.h"
 #include "model/glm_forward.h"
@@ -14,6 +15,7 @@
 #include "runtime/runtime_config.h"
 #include "self_test.h"
 #include "tokenizer/python_tokenizer.h"
+#include "tokenizer/native_tokenizer.h"
 #include "utils/logger.h"
 #include "utils/json_util.h"
 #include "utils/timer.h"
@@ -23,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <random>
 #include <string>
@@ -84,14 +87,34 @@ static void printUsage() {
         "  --temperature <f>    Sampling temperature (default 0.0 = greedy)\n"
         "  --top-p <f>          Top-p (nucleus) sampling threshold (default 1.0 = disabled)\n"
         "  --top-k <n>          Top-k sampling limit (default 0 = disabled)\n"
+        "  --min-p <f>          Min-p filter: keep tokens within f x p(max) (default 0 = disabled)\n"
+        "  --typical-p <f>      Locally-typical filter mass threshold (default 0 = disabled)\n"
+        "  --repetition-penalty <f>  Repetition penalty on the last 64 generated tokens (default 0)\n"
+        "  --frequency-penalty <f>   Frequency penalty: subtract f per occurrence in the window (default 0)\n"
+        "  --presence-penalty <f>    Presence penalty: subtract f per distinct token in the window (default 0)\n"
         "  --seed <n>           Random seed (default: random)\n"
+        "  --router-prefetch <n> Router-probability extra prefetch depth (default 0 = off)\n"
+        "  --prob-resident     Promote ~max-probability experts to residency pins\n"
+        "  --predictor ema     EMA popularity predictor for lookahead prefetch + LRU\n"
+        "                      soft-boost (item 4/14; default lookahead reuse)\n"
+        "  --ema-alpha <f>     EMA smoothing (0,1]; default 0.1\n"
+        "  --mtp                MTP/nextn predict head (hard gate: refuses to start with\n"
+        "                      a silent base-LM-head fallback; requires config-declared\n"
+        "                      MTP layers with tensors present AND verified forward math)\n"
         "  --python <path>      Python interpreter path\n"
         "  --script <path>      Tokenizer script path (default: auto-detect)\n"
+        "  --tokenizer <python|native>  Tokenizer backend (default: python subprocess)\n"
+        "  --dump-tokens <text> Encode text with the active tokenizer and exit\n"
         "  --gpu <auto|cpu|cuda|mps>  Compute backend (default: auto-detect)\n"
         "  --no-gpu             Force CPU compute (same as --gpu cpu)\n"
+        "  --gpu-experts <n>    Offload routed expert FFN to the GPU with a VRAM-\n"
+        "                       resident window of n experts (opt-in; default off)\n"
+        "  --gpu-expert-depth <d>  Expert staging depth: H2D copies d experts ahead\n"
+        "                       of compute (default 2; only with --gpu-experts)\n"
         "  --verbose            Enable debug logging\n"
         "  --version            Print version and exit\n"
         "  --self-test          Run functional self-tests (no model required) and exit\n"
+        "  --cuda-self-test     Run the GPU expert FFN parity self-test and exit\n"
         "  --check-weights      Validate model directory structurally and exit\n"
         "  --help               Show help\n",
         GLM_VERSION_STRING);
@@ -106,16 +129,31 @@ struct Args {
     float temperature = 0.0f;
     float topP = 1.0f;
     int topK = 0;
+    float minP = 0.0f;
+    float typicalP = 0.0f;
+    float repetitionPenalty = 0.0f;
+    float frequencyPenalty = 0.0f;
+    float presencePenalty = 0.0f;
+    int routerPrefetchExtra = 0;
+    bool probPriority = false;
+    bool emaPredictor = false;
+    float emaAlpha = 0.1f;
+    bool mtp = false;
     unsigned seed = 0;
     bool useSeed = false;
     std::string pythonExe = "python";
     std::string scriptPath;  // optional: explicit tokenizer script path
+    bool nativeTokenizer = false;
+    std::string dumpTokens;
     bool useGpu = true;
     BackendRequest gpuRequest = BackendRequest::Auto;
+    int gpuExpertCapacity = 0;
+    int gpuExpertDepth = 2;
     bool verbose = false;
     bool showVersion = false;
     bool selfTest = false;
     bool checkWeights = false;
+    bool cudaSelfTest = false;
 };
 
 static bool parseArgs(int argc, char** argv, Args& args) {
@@ -143,10 +181,36 @@ static bool parseArgs(int argc, char** argv, Args& args) {
         else if (a == "--temperature" && i + 1 < argc) { args.temperature = static_cast<float>(std::atof(argv[++i])); }
         else if (a == "--top-p" && i + 1 < argc) { args.topP = static_cast<float>(std::atof(argv[++i])); }
         else if (a == "--top-k" && i + 1 < argc) { args.topK = std::atoi(argv[++i]); }
+        else if (a == "--min-p" && i + 1 < argc) { args.minP = static_cast<float>(std::atof(argv[++i])); }
+        else if (a == "--typical-p" && i + 1 < argc) { args.typicalP = static_cast<float>(std::atof(argv[++i])); }
+        else if (a == "--repetition-penalty" && i + 1 < argc) { args.repetitionPenalty = static_cast<float>(std::atof(argv[++i])); }
+        else if (a == "--frequency-penalty" && i + 1 < argc) { args.frequencyPenalty = static_cast<float>(std::atof(argv[++i])); }
+        else if (a == "--presence-penalty" && i + 1 < argc) { args.presencePenalty = static_cast<float>(std::atof(argv[++i])); }
+        else if (a == "--router-prefetch" && i + 1 < argc) { args.routerPrefetchExtra = std::atoi(argv[++i]); }
+        else if (a == "--prob-resident") { args.probPriority = true; }
+        else if (a == "--predictor" && i + 1 < argc) { std::string p = argv[++i]; args.emaPredictor = (p == "ema"); }
+        else if (a == "--ema-alpha" && i + 1 < argc) { args.emaAlpha = static_cast<float>(std::atof(argv[++i])); }
+        else if (a == "--mtp") { args.mtp = true; }
         else if (a == "--seed" && i + 1 < argc) { args.seed = std::atoi(argv[++i]); args.useSeed = true; }
         else if (a == "--python" && i + 1 < argc) { args.pythonExe = argv[++i]; }
         else if (a == "--script" && i + 1 < argc) { args.scriptPath = argv[++i]; }
+        else if (a == "--tokenizer" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "native") args.nativeTokenizer = true;
+            else if (mode == "python") args.nativeTokenizer = false;
+            else { std::fprintf(stderr, "Unknown tokenizer mode: %s\n", mode.c_str()); return false; }
+        }
+        else if (a == "--dump-tokens" && i + 1 < argc) { args.dumpTokens = argv[++i]; }
         else if (a == "--no-gpu") { args.useGpu = false; }
+        else if (a == "--gpu-experts" && i + 1 < argc) {
+            const int v = std::atoi(argv[++i]);
+            args.gpuExpertCapacity = v > 0 ? v : 0;
+            if (args.gpuExpertCapacity == 0) GLM_LOG_WARN("--gpu-experts 0 disables GPU expert FFN");
+        }
+        else if (a == "--gpu-expert-depth" && i + 1 < argc) {
+            const int v = std::atoi(argv[++i]);
+            args.gpuExpertDepth = v >= 1 ? v : 1;
+        }
         else if (a == "--gpu" && i + 1 < argc) {
             std::string g = argv[++i];
             if (g == "auto") args.gpuRequest = BackendRequest::Auto;
@@ -158,11 +222,12 @@ static bool parseArgs(int argc, char** argv, Args& args) {
         else if (a == "--verbose") { args.verbose = true; }
         else if (a == "--version") { args.showVersion = true; }
         else if (a == "--self-test") { args.selfTest = true; }
+        else if (a == "--cuda-self-test") { args.cudaSelfTest = true; }
         else if (a == "--check-weights") { args.checkWeights = true; }
         else { GLM_LOG_WARN("Unknown argument: " + a); }
     }
-    // --version / --self-test do not require a model
-    if (args.showVersion || args.selfTest || args.checkWeights) return true;
+    // --version / --self-test / --cuda-self-test / --check-weights do not require a model
+    if (args.showVersion || args.selfTest || args.cudaSelfTest || args.checkWeights) return true;
     if (args.modelDir.empty()) {
         GLM_LOG_ERROR("--model not specified");
         printUsage();
@@ -242,6 +307,22 @@ int main(int argc, char** argv) {
         return fails == 0 ? 0 : 1;
     }
 
+    // GPU expert FFN device parity self-test (--cuda-self-test; no model needed).
+    if (args.cudaSelfTest) {
+        if (cudaInit()) {
+            const bool ok = cudaExpertSelfTest();
+            cudaShutdown();
+            if (ok) {
+                GLM_LOG_INFO("CUDA expert FFN parity self-test: PASS");
+                return 0;
+            }
+            GLM_LOG_ERROR("CUDA expert FFN parity self-test: FAIL");
+            return 1;
+        }
+        GLM_LOG_WARN("--cuda-self-test: no CUDA device available, skipping");
+        return 0;
+    }
+
     if (args.checkWeights) {
         if (args.modelDir.empty()) {
             GLM_LOG_ERROR("--model not specified for --check-weights");
@@ -292,7 +373,12 @@ int main(int argc, char** argv) {
     if (args.temperature > 0.0f) {
         GLM_LOG_INFO("Sampling: temperature=" + std::to_string(args.temperature) +
                      ", top-p=" + std::to_string(args.topP) +
-                     ", top-k=" + std::to_string(args.topK));
+                     ", top-k=" + std::to_string(args.topK) +
+                     ", min-p=" + std::to_string(args.minP) +
+                     ", typical-p=" + std::to_string(args.typicalP) +
+                     ", repetition-penalty=" + std::to_string(args.repetitionPenalty) +
+                     ", frequency-penalty=" + std::to_string(args.frequencyPenalty) +
+                     ", presence-penalty=" + std::to_string(args.presencePenalty));
     } else {
         GLM_LOG_INFO("Sampling: greedy (temperature=0)");
     }
@@ -307,6 +393,43 @@ int main(int argc, char** argv) {
     weightIndex.config.printSummary();
     weightIndex.printStats();
     GLM_LOG_INFO("Index build time: " + std::to_string(indexTimer.elapsedSec()) + " s");
+
+    // MTP / multi-token-prediction gating (item 8). GLM-5.2 declares MTP through
+    // num_nextn_predict_layers, but the checkpoint ships the nextn_predict_layers.*
+    // and nextn_predict_head weights separately. Per item 15 there is no silent
+    // degradation: a --mtp request that cannot be honoured is a hard error.
+    if (args.mtp) {
+        if (weightIndex.config.numMtpModules <= 0) {
+            GLM_LOG_ERROR("--mtp requested, but the checkpoint config declares no MTP "
+                          "modules (num_nextn_predict_layers / num_mtp_modules absent or 0). "
+                          "Remove --mtp and retry.");
+            return 1;
+        }
+        if (!weightIndex.hasMtpTensors) {
+            GLM_LOG_ERROR("--mtp requested, config declares " +
+                          std::to_string(weightIndex.config.numMtpModules) +
+                          " nextn predict layer(s), but the checkpoint ships no "
+                          "nextn_predict_layers.* / mtp_layers.* tensors, so MTP cannot "
+                          "run. Refusing to start (a silent base-LM-head fallback is "
+                          "forbidden, doc/design.md item 15). Add the MTP weight files "
+                          "or remove --mtp.");
+            return 1;
+        }
+        GLM_LOG_ERROR("--mtp: MTP weights detected (" +
+                      std::to_string(weightIndex.mtpTensorLayers) + " layers" +
+                      (weightIndex.hasMtpHead ? " + head" : ", no head") +
+                      "), but the MTP forward path is not yet validated against a "
+                      "reference; refusing to run unverified math.");
+        return 1;
+    }
+    if (weightIndex.config.numMtpModules > 0) {
+        GLM_LOG_INFO("Checkpoint config carries MTP heads (nextn_predict_layers=" +
+                     std::to_string(weightIndex.config.numMtpModules) +
+                     (weightIndex.hasMtpTensors
+                          ? ", tensors present: " + std::to_string(weightIndex.mtpTensorLayers) + " layer(s)"
+                          : ", but no MTP tensors in the index; --mtp will not start") +
+                     "; sampling runs on the base LM head.");
+    }
 
     // 2. CUDA backend (optional; only attempted when the adaptive profile
     //    resolved to CUDA and the user did not force CPU).
@@ -329,42 +452,52 @@ int main(int argc, char** argv) {
         GLM_LOG_WARN("Requested MPS backend but this host has no Apple Silicon GPU");
     }
 
-    // 3. Tokenizer (Python subprocess). Skipped entirely when --prompt-tokens
-    //    provides raw input ids (headless/CI end-to-end path).
+    // 3. Tokenizer. Default is the Python subprocess (byte-for-byte parity with
+    //    the reference transformers implementation). --tokenizer native enables
+    //    the in-process BPE tokenizer (tokenizer.json, opt-in). Skipped entirely
+    //    when --prompt-tokens provides raw input ids (headless/CI path).
     PythonTokenizer tokenizer;
+    NativeBpeTokenizer nativeToken;
     const bool useTokenizer = args.promptTokens.empty();
     if (args.promptTokens.empty()) {
         if (const char* pyEnv = std::getenv("GLM_PYTHON")) {
             if (*pyEnv) args.pythonExe = pyEnv;
         }
     }
-    // Resolve script path: --script > executable dir > CWD
-    std::string scriptPath;
-    if (!args.promptTokens.empty()) {
-        scriptPath = "";  // tokenizer not started
-    } else if (!args.scriptPath.empty() && std::filesystem::exists(args.scriptPath)) {
-        scriptPath = std::filesystem::canonical(args.scriptPath).string();
-    } else {
-        // Try next to the executable
-        std::filesystem::path exeDir = exeDirPath();
-        std::filesystem::path candidate1 = exeDir / ".." / ".." / "tools" / "tokenizer_server.py"; // build/Release -> project root
-        std::filesystem::path candidate2 = exeDir / ".." / "tools" / "tokenizer_server.py";         // build -> project root
-        std::filesystem::path candidate3 = exeDir / "tools" / "tokenizer_server.py";                // exe dir
-        std::filesystem::path candidate4 = std::filesystem::current_path() / "tools" / "tokenizer_server.py";
-
-        if (std::filesystem::exists(candidate1)) {
-            scriptPath = std::filesystem::canonical(candidate1).string();
-        } else if (std::filesystem::exists(candidate2)) {
-            scriptPath = std::filesystem::canonical(candidate2).string();
-        } else if (std::filesystem::exists(candidate3)) {
-            scriptPath = std::filesystem::canonical(candidate3).string();
-        } else if (std::filesystem::exists(candidate4)) {
-            scriptPath = std::filesystem::canonical(candidate4).string();
-        } else {
-            scriptPath = (std::filesystem::current_path() / "tools" / "tokenizer_server.py").string();
+    if (useTokenizer && args.nativeTokenizer) {
+        const std::string tj = args.modelDir + "/tokenizer.json";
+        const std::string tc = args.modelDir + "/tokenizer_config.json";
+        if (!nativeToken.load(tj, tc)) {
+            GLM_LOG_ERROR("Native tokenizer load failed (--tokenizer native): " + tj);
+            return 1;
         }
-    }
-    if (useTokenizer) {
+    } else if (useTokenizer) {
+        // Resolve script path: --script > executable dir > CWD
+        std::string scriptPath;
+        if (args.promptTokens.empty()) {
+            scriptPath = "";
+        } else if (!args.scriptPath.empty() && std::filesystem::exists(args.scriptPath)) {
+            scriptPath = std::filesystem::canonical(args.scriptPath).string();
+        } else {
+            // Try next to the executable
+            std::filesystem::path exeDir = exeDirPath();
+            std::filesystem::path candidate1 = exeDir / ".." / ".." / "tools" / "tokenizer_server.py"; // build/Release -> project root
+            std::filesystem::path candidate2 = exeDir / ".." / "tools" / "tokenizer_server.py";         // build -> project root
+            std::filesystem::path candidate3 = exeDir / "tools" / "tokenizer_server.py";                // exe dir
+            std::filesystem::path candidate4 = std::filesystem::current_path() / "tools" / "tokenizer_server.py";
+
+            if (std::filesystem::exists(candidate1)) {
+                scriptPath = std::filesystem::canonical(candidate1).string();
+            } else if (std::filesystem::exists(candidate2)) {
+                scriptPath = std::filesystem::canonical(candidate2).string();
+            } else if (std::filesystem::exists(candidate3)) {
+                scriptPath = std::filesystem::canonical(candidate3).string();
+            } else if (std::filesystem::exists(candidate4)) {
+                scriptPath = std::filesystem::canonical(candidate4).string();
+            } else {
+                scriptPath = (std::filesystem::current_path() / "tools" / "tokenizer_server.py").string();
+            }
+        }
         GLM_LOG_INFO("Starting Python tokenizer: " + args.pythonExe);
         GLM_LOG_INFO("Tokenizer script: " + scriptPath);
         if (!tokenizer.start(args.pythonExe, scriptPath, args.modelDir)) {
@@ -373,6 +506,39 @@ int main(int argc, char** argv) {
         }
     } else {
         GLM_LOG_INFO("Raw token ids provided (--prompt-tokens); tokenizer skipped");
+    }
+
+    // Generic encode/decode entry points (python subprocess or native BPE).
+    auto encodeText = [&](const std::string& text, bool special) -> std::vector<int> {
+        if (args.nativeTokenizer) return nativeToken.encode(text, special);
+        return tokenizer.encode(text, special);
+    };
+    auto decodeIds = [&](const std::vector<int>& ids) -> std::string {
+        if (args.nativeTokenizer) return nativeToken.decode(ids, true);
+        return tokenizer.decode(ids, true);
+    };
+    auto vocabSizeOf = [&]() -> int {
+        if (args.nativeTokenizer) return nativeToken.vocabSize();
+        return tokenizer.vocabSize();
+    };
+    auto eosOf = [&]() -> int {
+        if (args.nativeTokenizer) return nativeToken.eosTokenId();
+        return tokenizer.eosTokenId();
+    };
+
+    // Hidden debug/CI helper: encode one text with the active tokenizer and exit.
+    // Used by tests/test_native_tokenizer.py to compare the native BPE backend
+    // against the reference transformers tokenizer (real model directory).
+    if (!args.dumpTokens.empty()) {
+        std::vector<int> dumpIds = encodeText(args.dumpTokens, false);
+        std::string csv;
+        for (size_t i = 0; i < dumpIds.size(); ++i) {
+            if (i) csv += ",";
+            csv += std::to_string(dumpIds[i]);
+        }
+        GLM_LOG_INFO("TOKEN: " + csv);
+        GLM_LOG_INFO("TOKEN_DEC: " + jsonEscapeString(decodeIds(dumpIds)));
+        return 0;
     }
 
     // 4. Forward engine + scheduler (LRU/IOCP expert pipeline)
@@ -385,6 +551,8 @@ int main(int argc, char** argv) {
     }
     GLM_LOG_INFO("Scheduler ready: LRU " + std::to_string(ac.lruBytes / (1024 * 1024)) +
                  " MB, IOCP workers " + std::to_string(ac.iocpWorkers));
+    scheduler.setRouterPrefetch(args.routerPrefetchExtra, args.probPriority);
+    if (args.emaPredictor) scheduler.setPopularityPredictor(args.emaAlpha, true);
 
     GLMForward forwarder(weightIndex);
     if (!forwarder.init()) {
@@ -392,6 +560,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     forwarder.attachScheduler(&scheduler);
+    if (args.gpuExpertCapacity > 0) {
+        forwarder.enableGpuExperts(args.gpuExpertCapacity, args.gpuExpertDepth);
+        if (!forwarder.gpuExpertsEnabled()) {
+            // Item 15: a requested, unavailable offload is a hard error, never a
+            // silent degradation. The user can re-run with --gpu-experts 0.
+            GLM_LOG_ERROR("--gpu-experts <n> requested but the CUDA expert FFN is "
+                          "not available. Re-run without it (or with --gpu-experts 0).");
+            return 1;
+        }
+    }
 
     // 5. Random number generator for sampling
     std::mt19937 rng;
@@ -409,7 +587,10 @@ int main(int argc, char** argv) {
         if (hasPromptTokens) {
             inputIds = args.promptTokens;
         } else if (args.rawEncode) {
-            inputIds = tokenizer.encode(args.prompt, true);
+            inputIds = encodeText(args.prompt, true);
+        } else if (args.nativeTokenizer) {
+            GLM_LOG_WARN("Native tokenizer has no chat template; encoding prompt directly");
+            inputIds = encodeText(args.prompt, true);
         } else {
             // The prompt must be JSON-escaped so quotes/backslashes/newlines in
             // the user message cannot break the chat-template JSON payload.
@@ -433,11 +614,15 @@ int main(int argc, char** argv) {
         }
 
         Timer genTimer;
+        const clock_t cpuStart = std::clock();
         std::vector<int> generatedIds;
         std::vector<int> allIds = inputIds;
         const bool useSampling = args.temperature > 0.0f && useTokenizer;
-        const int vocabSize = useTokenizer ? tokenizer.vocabSize() : 0;
-        const int eosTok = useTokenizer ? tokenizer.eosTokenId() : -1;
+        const int vocabSize = useTokenizer ? vocabSizeOf() : 0;
+        const int eosTok = useTokenizer ? eosOf() : -1;
+        // Repetition-penalty window: last kRewind generated tokens.
+        constexpr int kPenaltyWindow = 64;
+        std::vector<int> recentTokens(kPenaltyWindow, -1);
 
         for (int t = 0; unlimited || t < maxTokens; ++t) {
             // forward() fills the full logits vector (when requested) and returns
@@ -451,11 +636,19 @@ int main(int argc, char** argv) {
 
             if (useSampling) {
                 nextToken = sampleFromLogits(logits.data(), vocabSize,
-                                             args.temperature, args.topP, args.topK, rng);
+                                             args.temperature, args.topP, args.topK,
+                                             args.minP, args.repetitionPenalty,
+                                             recentTokens.data(),
+                                             int(recentTokens.size()),
+                                             args.typicalP, args.frequencyPenalty,
+                                             args.presencePenalty,
+                                             rng);
             }
 
             generatedIds.push_back(nextToken);
             allIds.push_back(nextToken);
+            std::rotate(recentTokens.begin(), recentTokens.begin() + 1, recentTokens.end());
+            recentTokens.back() = nextToken;
 
             if (useTokenizer && nextToken == eosTok) {
                 GLM_LOG_INFO("EOS encountered, stopping generation");
@@ -482,8 +675,14 @@ int main(int argc, char** argv) {
             GLM_LOG_INFO("Speed: " + std::to_string(generatedIds.size() / elapsed) + " tok/s");
         }
 
+        // Emit runtime telemetry for scripts/benchmark.py (item: benchmark
+        // upgrade): a single machine-parseable JSON line.
+        InferenceStats::instance().prefetchWasted += scheduler.lru().evictedPrefetchedUnused();
+        const uint64_t cpuNs = uint64_t(double(std::clock() - cpuStart) / CLOCKS_PER_SEC * 1e9);
+        GLM_LOG_INFO("STATS: " + InferenceStats::instance().toJson(cpuNs, elapsed, generatedIds.size()));
+
         if (useTokenizer) {
-            std::string output = tokenizer.decode(generatedIds, true);
+            std::string output = decodeIds(generatedIds);
             GLM_LOG_INFO("Output: " + output);
         } else {
             std::string idsStr;

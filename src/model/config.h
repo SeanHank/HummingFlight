@@ -57,6 +57,23 @@ struct ModelConfig {
     bool normTopkProb = true;
     int topkGroup = 1;
 
+    // ---- MTP (Multi-Token Prediction heads, GLM-5.2) ----
+    // GLM-5.2 ("GlmMoeDsaForCausalLM") expresses MTP as `num_nextn_predict_layers`
+    // (1 in 5.2-bf16); the GLM-4.5-era spelling was `num_mtp_modules` +
+    // `num_mtp_layers_per_module`. Both parse into numMtpModules so the engine can
+    // gate a noisy opt-in on either naming, and the weight index can look for
+    // `model.nextn_predict_layers.<i>.*` / `model.mtp_layers.<i>.*` tensors.
+    int numMtpModules = 0;           // num_nextn_predict_layers or num_mtp_modules (>0 => MTP configured)
+    int numMtpLayersPerModule = 0;   // num_mtp_layers_per_module (legacy GLM-4.5 depth)
+    int mtpHiddenSize = 0;           // mtp_hidden_size (legacy; GLM-5.2 reuses hidden_size)
+    int mtpIntermediateSize = 0;     // mtp_intermediate_size (legacy; GLM-5.2 reuses moe_intermediate)
+    std::string mtpActivation = "silu";
+    std::vector<std::string> mtpLayerTypes;  // mtp_layer_types (["shared", ...] in 5.2)
+    // GLM-5.2 DSA: the MTP iteration shares the base iteration's index top-k
+    // selection (index_share_for_mtp_iteration = true) instead of re-running the
+    // indexer corpus search.
+    bool indexShareForMtpIteration = false;
+
     // ---- Normalization and activation ----
     float rmsNormEps = 1e-5f;
     std::string hiddenAct = "silu";
@@ -70,6 +87,10 @@ struct ModelConfig {
 
     // Parse from file
     bool loadFromFile(const std::string& path);
+
+    // Parse from an in-memory JSON document (used by self-tests and by
+    // loadFromFile). Uses the real picojson parser (item 6).
+    bool loadFromString(const std::string& jsonText);
 
     // Determine whether layer L is a MoE layer
     bool isMoeLayer(int layer) const {

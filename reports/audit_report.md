@@ -4,8 +4,8 @@
 |---|---|
 | Project version | `2026.9.0` |
 | Platform | `Windows-10-10.0.19044-SP0` |
-| Python | `3.11.15` |
-| Timestamp (UTC) | `2026-09-13T04:20:07Z` |
+| Python | `3.13.5` |
+| Timestamp (UTC) | `2026-09-13T12:52:54Z` |
 
 ## Marker scan
 

@@ -168,10 +168,22 @@ const BFloat16* GLMForward::getWeightPtr(const TensorLocation& loc) {
 }
 
 bool GLMForward::loadWeightToF32(const TensorLocation& loc, float* buf, int numel) {
-    const BFloat16* ptr = getWeightPtr(loc);
-    if (!ptr) return false;
-    for (int i = 0; i < numel; ++i) buf[i] = ptr[i].toF32();
+    const uint8_t* raw = getWeightRaw(loc);
+    if (!raw) return false;
+    if (loc.dtype == "F32") {
+        const float* f = reinterpret_cast<const float*>(raw);
+        for (int i = 0; i < numel; ++i) buf[i] = f[i];
+    } else {
+        const BFloat16* b = reinterpret_cast<const BFloat16*>(raw);
+        for (int i = 0; i < numel; ++i) buf[i] = b[i].toF32();
+    }
     return true;
+}
+
+const uint8_t* GLMForward::getWeightRaw(const TensorLocation& loc) {
+    const uint8_t* view = index_->getShardView(loc.shardPath);
+    if (!view) return nullptr;
+    return view + loc.byteOffset;
 }
 
 void GLMForward::rmsNorm(const TensorLocation& w, float* x, int n) {
@@ -236,41 +248,42 @@ void GLMForward::dsaIndexer(int layer, const float* hiddenStates, const float* q
 
     // ---- Indexer Q: wq_b(q_resid) -> [idxHeads * idxDim], rope on first idxRope ----
     int iqDim = idxHeads * idxDim;
-    std::vector<float> iq(iqDim);
+    ensureFloat(ws_.iq, size_t(iqDim));
     const BFloat16* wqB = getWeightPtr(lw.indexWqB);
-    gemv_bf16_f32(wqB, qResid, iq.data(), iqDim, cfg.qLoraRank);
+    gemv_bf16_f32(wqB, qResid, ws_.iq.data(), iqDim, cfg.qLoraRank);
     for (int h = 0; h < idxHeads; ++h) {
-        applyRoPE(iq.data() + size_t(h) * size_t(idxDim), idxRope, seqLen_, 0, cfg.ropeInterleave);
+        applyRoPE(ws_.iq.data() + size_t(h) * size_t(idxDim), idxRope, seqLen_, 0, cfg.ropeInterleave);
     }
 
     // ---- Indexer K: k_norm(wk(hidden_states)), rope on first idxRope ----
-    std::vector<float> iK(idxDim);
+    ensureFloat(ws_.iK, size_t(idxDim));
     const BFloat16* wk = getWeightPtr(lw.indexWk);
-    gemv_bf16_f32(wk, hiddenStates, iK.data(), idxDim, hidden);
-    layerNorm(lw.indexKNormW, lw.indexKNormB, iK.data(), idxDim);
-    applyRoPE(iK.data(), idxRope, seqLen_, 0, cfg.ropeInterleave);
-    kvCache_.appendIndexKey(layer, seqLen_, iK.data());
+    gemv_bf16_f32(wk, hiddenStates, ws_.iK.data(), idxDim, hidden);
+    layerNorm(lw.indexKNormW, lw.indexKNormB, ws_.iK.data(), idxDim);
+    applyRoPE(ws_.iK.data(), idxRope, seqLen_, 0, cfg.ropeInterleave);
+    kvCache_.appendIndexKey(layer, seqLen_, ws_.iK.data());
 
     // ---- Per-head gate weights: weights_proj(hidden_states) * n_heads^-0.5 ----
-    std::vector<float> wVec(idxHeads);
+    ensureFloat(ws_.wVec, size_t(idxHeads));
     const BFloat16* wProj = getWeightPtr(lw.indexWeightsProj);
-    gemv_bf16_f32(wProj, hiddenStates, wVec.data(), idxHeads, hidden);
+    gemv_bf16_f32(wProj, hiddenStates, ws_.wVec.data(), idxHeads, hidden);
     float wScale = 1.0f / std::sqrt(float(idxHeads));
-    for (int h = 0; h < idxHeads; ++h) wVec[h] *= wScale;
+    for (int h = 0; h < idxHeads; ++h) ws_.wVec[h] *= wScale;
 
     // ---- Index scores: sum_h w_h * relu(q_h . k_t * head_dim^-0.5) ----
     int seqLen = seqLen_ + 1;
     float invScale = 1.0f / std::sqrt(float(idxDim));
     int topk = std::min<int>(cfg.indexTopk, seqLen);
-    std::vector<std::pair<float, int>> ranked;
-    ranked.reserve(seqLen);
+    auto& ranked = ws_.ranked;
+    ranked.clear();
+    ranked.reserve(size_t(seqLen));
     for (int t = 0; t < seqLen; ++t) {
         const float* kt = kvCache_.getIndexKey(layer, t);
         float s = 0.0f;
         for (int h = 0; h < idxHeads; ++h) {
-            float score = dotF32(iq.data() + size_t(h) * size_t(idxDim), kt, idxDim) * invScale;
+            float score = dotF32(ws_.iq.data() + size_t(h) * size_t(idxDim), kt, idxDim) * invScale;
             if (score < 0.0f) score = 0.0f;  // ReLU
-            s += wVec[h] * score;
+            s += ws_.wVec[h] * score;
         }
         ranked.emplace_back(s, t);
     }
@@ -297,62 +310,63 @@ void GLMForward::attentionLayer(int layer, const float* hiddenStates, float* out
     int qkRope = cfg.qkRopeHeadDim;
     int vDim = cfg.vHeadDim;
     int qkTotal = cfg.qkHeadDim;
+    auto& ws = ws_;
 
     // ---- Q: q_a_proj -> q_a_layernorm -> q_b_proj ----
-    std::vector<float> qResid(qLora);
+    ensureFloat(ws.qResid, size_t(qLora));
     const BFloat16* qAW = getWeightPtr(lw.qAProj);
-    gemv_bf16_f32(qAW, hiddenStates, qResid.data(), qLora, hidden);
-    rmsNorm(lw.qALayernorm, qResid.data(), qLora);
+    gemv_bf16_f32(qAW, hiddenStates, ws.qResid.data(), qLora, hidden);
+    rmsNorm(lw.qALayernorm, ws.qResid.data(), qLora);
 
     int qOutDim = heads * qkTotal;
-    std::vector<float> qB(qOutDim);
+    ensureFloat(ws.qB, size_t(qOutDim));
     const BFloat16* qBW = getWeightPtr(lw.qBProj);
-    gemv_bf16_f32(qBW, qResid.data(), qB.data(), qOutDim, qLora);
+    gemv_bf16_f32(qBW, ws.qResid.data(), ws.qB.data(), qOutDim, qLora);
 
     // Split Q: [qkNope] and [qkRope] per head
-    std::vector<float> qNope(heads * qkNope);
-    std::vector<float> qRope(heads * qkRope);
+    ensureFloat(ws.qNope, size_t(heads) * size_t(qkNope));
+    ensureFloat(ws.qRope, size_t(heads) * size_t(qkRope));
     for (int h = 0; h < heads; ++h) {
-        const float* src = qB.data() + h * qkTotal;
-        std::memcpy(qNope.data() + h * qkNope, src, qkNope * sizeof(float));
-        std::memcpy(qRope.data() + h * qkRope, src + qkNope, qkRope * sizeof(float));
-        applyRoPE(qRope.data() + h * qkRope, qkRope, seqLen_, 0, cfg.ropeInterleave);
+        const float* src = ws.qB.data() + h * qkTotal;
+        std::memcpy(ws.qNope.data() + h * qkNope, src, qkNope * sizeof(float));
+        std::memcpy(ws.qRope.data() + h * qkRope, src + qkNope, qkRope * sizeof(float));
+        applyRoPE(ws.qRope.data() + h * qkRope, qkRope, seqLen_, 0, cfg.ropeInterleave);
     }
 
     // ---- Compressed KV for the current token ----
     int kvAOut = kvLora + qkRope;
-    std::vector<float> kvA(kvAOut);
+    ensureFloat(ws.kvA, size_t(kvAOut));
     const BFloat16* kvAW = getWeightPtr(lw.kvAProjWithMqa);
-    gemv_bf16_f32(kvAW, hiddenStates, kvA.data(), kvAOut, hidden);
+    gemv_bf16_f32(kvAW, hiddenStates, ws.kvA.data(), kvAOut, hidden);
 
-    std::vector<float> kvLatent(kvLora);
-    std::vector<float> kRope(qkRope);
-    std::memcpy(kvLatent.data(), kvA.data(), kvLora * sizeof(float));
-    std::memcpy(kRope.data(), kvA.data() + kvLora, qkRope * sizeof(float));
-    rmsNorm(lw.kvALayernorm, kvLatent.data(), kvLora);
-    applyRoPE(kRope.data(), qkRope, seqLen_, 0, cfg.ropeInterleave);
+    ensureFloat(ws.kvLatent, size_t(kvLora));
+    ensureFloat(ws.kRope, size_t(qkRope));
+    std::memcpy(ws.kvLatent.data(), ws.kvA.data(), kvLora * sizeof(float));
+    std::memcpy(ws.kRope.data(), ws.kvA.data() + kvLora, qkRope * sizeof(float));
+    rmsNorm(lw.kvALayernorm, ws.kvLatent.data(), kvLora);
+    applyRoPE(ws.kRope.data(), qkRope, seqLen_, 0, cfg.ropeInterleave);
 
     // ---- Expand the current token's per-head k/v and cache it ----
     int kvBOut = heads * (qkNope + vDim);
-    std::vector<float> expandedNew(kvBOut);
+    ensureFloat(ws.expandedNew, size_t(kvBOut));
     const BFloat16* kvBW = getWeightPtr(lw.kvBProj);
-    gemv_bf16_f32(kvBW, kvLatent.data(), expandedNew.data(), kvBOut, kvLora);
+    gemv_bf16_f32(kvBW, ws.kvLatent.data(), ws.expandedNew.data(), kvBOut, kvLora);
 
-    std::vector<float> kNew(size_t(heads) * size_t(qkTotal));
-    std::vector<float> vNew(size_t(heads) * size_t(vDim));
+    ensureFloat(ws.kNew, size_t(heads) * size_t(qkTotal));
+    ensureFloat(ws.vNew, size_t(heads) * size_t(vDim));
     for (int h = 0; h < heads; ++h) {
-        const float* src = expandedNew.data() + size_t(h) * size_t(qkNope + vDim);
-        float* kd = kNew.data() + size_t(h) * size_t(qkTotal);
+        const float* src = ws.expandedNew.data() + size_t(h) * size_t(qkNope + vDim);
+        float* kd = ws.kNew.data() + size_t(h) * size_t(qkTotal);
         std::memcpy(kd, src, qkNope * sizeof(float));
-        std::memcpy(kd + qkNope, kRope.data(), qkRope * sizeof(float));
-        std::memcpy(vNew.data() + size_t(h) * size_t(vDim), src + qkNope, vDim * sizeof(float));
+        std::memcpy(kd + qkNope, ws.kRope.data(), qkRope * sizeof(float));
+        std::memcpy(ws.vNew.data() + size_t(h) * size_t(vDim), src + qkNope, vDim * sizeof(float));
     }
-    kvCache_.appendKey(layer, seqLen_, kNew.data());
-    kvCache_.appendValue(layer, seqLen_, vNew.data());
+    kvCache_.appendKey(layer, seqLen_, ws.kNew.data());
+    kvCache_.appendValue(layer, seqLen_, ws.vNew.data());
 
     // ---- DSA indexer: full layers compute, shared layers reuse selSet ----
     if (dsaEnabled_ && cfg.isIndexerFull(layer)) {
-        dsaIndexer(layer, hiddenStates, qResid.data(), selSet);
+        dsaIndexer(layer, hiddenStates, ws.qResid.data(), selSet);
     }
     if (selSet.empty()) {  // degenerate safety: attend to every position
         int seqLen = seqLen_ + 1;
@@ -363,37 +377,39 @@ void GLMForward::attentionLayer(int layer, const float* hiddenStates, float* out
     // ---- Sparse attention over the selected positions ----
     int seqLen = seqLen_ + 1;
     float invSqrtD = 1.0f / std::sqrt(float(qkTotal));
-    std::vector<float> attnOut(heads * vDim, 0.0f);
+    ensureFloat(ws.attnOut, size_t(heads) * size_t(vDim));
+    std::fill(ws.attnOut.begin(), ws.attnOut.end(), 0.0f);
 
     for (int h = 0; h < heads; ++h) {
-        std::vector<float> qCur(qkTotal);
-        std::memcpy(qCur.data(), qNope.data() + h * qkNope, qkNope * sizeof(float));
-        std::memcpy(qCur.data() + qkNope, qRope.data() + h * qkRope, qkRope * sizeof(float));
+        ensureFloat(ws.qCur, size_t(qkTotal));
+        std::memcpy(ws.qCur.data(), ws.qNope.data() + h * qkNope, qkNope * sizeof(float));
+        std::memcpy(ws.qCur.data() + qkNope, ws.qRope.data() + h * qkRope, qkRope * sizeof(float));
 
-        std::vector<float> scores(selSet.size());
+        ensureFloat(ws.scores, selSet.size());
+        float* scores = ws.scores.data();
         for (size_t i = 0; i < selSet.size(); ++i) {
             int t = selSet[i];
             if (t < 0 || t >= seqLen) { scores[i] = -1e30f; continue; }
-            const float* histK = kvCache_.getKey(layer, t) + size_t(h) * size_t(qkTotal);
-            scores[i] = dotF32(qCur.data(), histK, qkTotal) * invSqrtD;
+            const float* histK = kvCache_.getKey(layer, h, t);
+            scores[i] = dotF32(ws.qCur.data(), histK, qkTotal) * invSqrtD;
         }
 
-        softmax_f32(scores.data(), int(scores.size()));
+        softmax_f32(scores, int(selSet.size()));
 
         for (size_t i = 0; i < selSet.size(); ++i) {
             int t = selSet[i];
             if (t < 0 || t >= seqLen) continue;
-            const float* histV = kvCache_.getValue(layer, t) + size_t(h) * size_t(vDim);
+            const float* histV = kvCache_.getValue(layer, h, t);
             float weight = scores[i];
             for (int d = 0; d < vDim; ++d) {
-                attnOut[h * vDim + d] += weight * histV[d];
+                ws.attnOut[h * vDim + d] += weight * histV[d];
             }
         }
     }
 
     // ---- o_proj ----
     const BFloat16* oW = getWeightPtr(lw.oProj);
-    gemv_bf16_f32(oW, attnOut.data(), output, hidden, heads * vDim);
+    gemv_bf16_f32(oW, ws.attnOut.data(), output, hidden, heads * vDim);
 }
 
 void GLMForward::denseMlp(const LayerWeights& lw, const float* input, float* output) {
@@ -401,35 +417,39 @@ void GLMForward::denseMlp(const LayerWeights& lw, const float* input, float* out
     int hidden = cfg.hiddenSize;
     int inter = cfg.intermediateSize;
 
-    std::vector<float> gate(inter), up(inter), mid(inter);
+    ensureFloat(ws_.gate, size_t(inter));
+    ensureFloat(ws_.up, size_t(inter));
+    ensureFloat(ws_.mid, size_t(inter));
     const BFloat16* gateW = getWeightPtr(lw.mlpGate);
     const BFloat16* upW = getWeightPtr(lw.mlpUp);
     const BFloat16* downW = getWeightPtr(lw.mlpDown);
 
-    gemv_bf16_f32(gateW, input, gate.data(), inter, hidden);
-    gemv_bf16_f32(upW, input, up.data(), inter, hidden);
+    gemv_bf16_f32(gateW, input, ws_.gate.data(), inter, hidden);
+    gemv_bf16_f32(upW, input, ws_.up.data(), inter, hidden);
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < inter; ++i) {
-        mid[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
+        ws_.mid[i] = ws_.gate[i] / (1.0f + std::exp(-ws_.gate[i])) * ws_.up[i];
     }
 
-    gemv_bf16_f32(downW, mid.data(), output, hidden, inter);
+    gemv_bf16_f32(downW, ws_.mid.data(), output, hidden, inter);
 }
 
 void GLMForward::expertFFNRaw(const BFloat16* gateW, const BFloat16* upW, const BFloat16* downW,
                               const float* hiddenStates, float* output,
                               int hiddenSize, int interSize) {
-    std::vector<float> gate(interSize), up(interSize), mid(interSize);
+    ensureFloat(ws_.gate, size_t(interSize));
+    ensureFloat(ws_.up, size_t(interSize));
+    ensureFloat(ws_.mid, size_t(interSize));
 
-    gemv_bf16_f32(gateW, hiddenStates, gate.data(), interSize, hiddenSize);
-    gemv_bf16_f32(upW, hiddenStates, up.data(), interSize, hiddenSize);
+    gemv_bf16_f32(gateW, hiddenStates, ws_.gate.data(), interSize, hiddenSize);
+    gemv_bf16_f32(upW, hiddenStates, ws_.up.data(), interSize, hiddenSize);
 
     for (int i = 0; i < interSize; ++i) {
-        mid[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
+        ws_.mid[i] = ws_.gate[i] / (1.0f + std::exp(-ws_.gate[i])) * ws_.up[i];
     }
 
-    gemv_bf16_f32(downW, mid.data(), output, hiddenSize, interSize);
+    gemv_bf16_f32(downW, ws_.mid.data(), output, hiddenSize, interSize);
 }
 
 void GLMForward::expertFFN(const ExpertWeights& ew, const float* hiddenStates,
@@ -447,17 +467,19 @@ void GLMForward::sharedExpertFFNRaw(const BFloat16* gateW, const BFloat16* upW,
         std::fill(output, output + hidden, 0.0f);
         return;
     }
-    std::vector<float> gate(gateInter), up(gateInter), mid(gateInter);
+    ensureFloat(ws_.gate, size_t(gateInter));
+    ensureFloat(ws_.up, size_t(gateInter));
+    ensureFloat(ws_.mid, size_t(gateInter));
 
-    gemv_bf16_f32(gateW, input, gate.data(), gateInter, hidden);
-    gemv_bf16_f32(upW, input, up.data(), gateInter, hidden);
+    gemv_bf16_f32(gateW, input, ws_.gate.data(), gateInter, hidden);
+    gemv_bf16_f32(upW, input, ws_.up.data(), gateInter, hidden);
 
     #pragma omp parallel for schedule(static)
     for (int i = 0; i < gateInter; ++i) {
-        mid[i] = gate[i] / (1.0f + std::exp(-gate[i])) * up[i];
+        ws_.mid[i] = ws_.gate[i] / (1.0f + std::exp(-ws_.gate[i])) * ws_.up[i];
     }
 
-    gemv_bf16_f32(downW, mid.data(), output, hidden, gateInter);
+    gemv_bf16_f32(downW, ws_.mid.data(), output, hidden, gateInter);
 }
 
 void GLMForward::sharedExpertFFN(const LayerWeights& lw, const float* input, float* output) {
@@ -474,6 +496,20 @@ void GLMForward::sharedExpertFFN(const LayerWeights& lw, const float* input, flo
     sharedExpertFFNRaw(gateW, upW, downW, input, output, inter, hidden);
 }
 
+void GLMForward::enableGpuExperts(int capacity, int stagingDepth) {
+    if (capacity <= 0) return;
+    gpuStagingDepth_ = std::max(1, stagingDepth);
+    if (gpuExpertCacheConfig(capacity, gpuStagingDepth_)) {
+        gpuExperts_ = true;
+        GLM_LOG_INFO("GPU expert FFN: ENABLED (VRAM-resident window of " +
+                     std::to_string(capacity) + " experts, staging depth " +
+                     std::to_string(gpuStagingDepth_) + ", CPU fallback active)");
+    } else {
+        GLM_LOG_WARN("GPU expert FFN not available (no CUDA device or CUDA build); "
+                     "running expert FFNs on CPU");
+    }
+}
+
 void GLMForward::moeLayer(int layer, const float* input, float* output) {
     const auto& cfg = index_->config;
     const auto& lw = index_->layers[layer];
@@ -483,58 +519,113 @@ void GLMForward::moeLayer(int layer, const float* input, float* output) {
     int topK = cfg.numExpertsPerTok;
 
     // ---- Router ----
-    std::vector<float> scores(numExperts);
+    ensureFloat(ws_.routerScores, size_t(numExperts));
     const BFloat16* gateW = getWeightPtr(lw.mlpGate);
-    gemv_bf16_f32(gateW, input, scores.data(), numExperts, hidden);
+    gemv_bf16_f32(gateW, input, ws_.routerScores.data(), numExperts, hidden);
 
     for (int i = 0; i < numExperts; ++i) {
-        scores[i] = 1.0f / (1.0f + std::exp(-scores[i]));
+        ws_.routerScores[i] = 1.0f / (1.0f + std::exp(-ws_.routerScores[i]));
     }
 
-    std::vector<float> bias;
     const float* biasPtr = nullptr;
     if (lw.gateBias.byteSize > 0) {
-        bias.resize(numExperts);
-        const BFloat16* b = getWeightPtr(lw.gateBias);
-        for (int i = 0; i < numExperts; ++i) bias[i] = b[i].toF32();
-        biasPtr = bias.data();
+        ensureFloat(ws_.bias, size_t(numExperts));
+        if (!loadWeightToF32(lw.gateBias, ws_.bias.data(), numExperts)) {
+            GLM_LOG_ERROR("Cannot read router correction bias for layer " + std::to_string(layer));
+            return;
+        }
+        biasPtr = ws_.bias.data();
     }
 
-    auto topk = topKScores(scores.data(), numExperts, biasPtr, topK,
+    auto topk = topKScores(ws_.routerScores.data(), numExperts, biasPtr, topK,
                            cfg.routedScalingFactor, cfg.normTopkProb);
 
-    // Feed the router output to the scheduler for one-layer-ahead prefetch.
+    // Feed the router output (with its weights/probabilities) to the scheduler
+    // for one-layer-ahead prefetch + router-probability mode.
     if (scheduler_) {
-        scheduler_->onLayerRouterDone(layer,
-                                      std::vector<int>(topk.indices, topk.indices + topk.k));
+        std::vector<int> idx(topk.indices, topk.indices + topk.k);
+        std::vector<float> wts(topk.weights, topk.weights + topk.k);
+        scheduler_->onLayerRouterDone(layer, idx, wts);
     }
 
     // ---- Routed expert FFN weighted merge ----
-    std::vector<float> moeOut(hidden, 0.0f);
-    for (int i = 0; i < topk.k; ++i) {
-        int eid = topk.indices[i];
-        float w = topk.weights[i];
-        std::vector<float> expertOut(hidden, 0.0f);
-        if (scheduler_) {
-            const uint8_t* eptr = scheduler_->getExpertPtr(layer, eid);
-            if (eptr) {
-                const BFloat16* eG = reinterpret_cast<const BFloat16*>(eptr);
-                const BFloat16* eU = eG + int64_t(inter) * hidden;
-                const BFloat16* eD = eU + int64_t(inter) * hidden;
-                expertFFNRaw(eG, eU, eD, input, expertOut.data(), hidden, inter);
-            } else {
-                expertFFN(index_->routedExperts[layer][eid], input,
-                          expertOut.data(), hidden, inter);
+    // With --gpu-experts the elected experts stream through the CUDA deep
+    // staging pipeline: compute(N) || H2D(N+1) ... || H2D(N+stagingDepth).
+    // Any device error restarts the layer's experts on CPU so output is exact.
+    ensureFloat(ws_.moeOut, size_t(hidden));
+    std::fill(ws_.moeOut.begin(), ws_.moeOut.end(), 0.0f);
+
+    int k = topk.k;
+    bool gpuOk = gpuExperts_ && scheduler_ != nullptr && k > 0;
+    int stagedEnd = 0;  // next topk index to stage (already really staged)
+
+    auto stageExpertAt = [&](int idx) -> bool {
+        if (idx >= k) return true;
+        const uint8_t* ne = scheduler_->getExpertPtr(layer, topk.indices[idx]);
+        if (!ne) return false;
+        return gpuExpertStage(layer, topk.indices[idx],
+                              reinterpret_cast<const BFloat16*>(ne), hidden, inter);
+    };
+
+    if (gpuOk) {
+        // Deep preload: stage experts 0..depth-1 so the first depth copies are
+        // already in flight before any compute, exactly the #2 pattern when a
+        // router looks depth layers ahead.
+        const int preload = std::min(k, std::max(1, gpuStagingDepth_));
+        for (int d = 0; d < preload && gpuOk; ++d) {
+            gpuOk = stageExpertAt(d);
+            stagedEnd = d + 1;
+        }
+    }
+
+    for (int i = 0; i < k; ++i) {
+        if (gpuOk && stagedEnd < k) {
+            // Advance the pipeline one slot past the expert we are about to
+            // compute; its async H2D overlaps this expert's FFN on the device.
+            if (!stageExpertAt(stagedEnd)) {
+                gpuOk = false;
+            }
+            stagedEnd++;
+        }
+
+        ensureFloat(ws_.expertOut, size_t(hidden));
+        std::fill(ws_.expertOut.begin(), ws_.expertOut.end(), 0.0f);
+
+        if (gpuOk) {
+            if (!gpuExpertFFN(layer, topk.indices[i], input,
+                              ws_.expertOut.data(), hidden, inter)) {
+                gpuOk = false;
+                stagedEnd = k;  // no more staging; rest stays on CPU
+                std::fill(ws_.moeOut.begin(), ws_.moeOut.end(), 0.0f);
+                i = -1;  // restart the whole layer on CPU for byte-exact output
+                continue;
             }
         } else {
-            expertFFN(index_->routedExperts[layer][eid], input,
-                      expertOut.data(), hidden, inter);
+            int eid = topk.indices[i];
+            float w = topk.weights[i];
+            if (scheduler_) {
+                const uint8_t* eptr = scheduler_->getExpertPtr(layer, eid);
+                if (eptr) {
+                    const BFloat16* eG = reinterpret_cast<const BFloat16*>(eptr);
+                    const BFloat16* eU = eG + int64_t(inter) * hidden;
+                    const BFloat16* eD = eU + int64_t(inter) * hidden;
+                    expertFFNRaw(eG, eU, eD, input, ws_.expertOut.data(), hidden, inter);
+                } else {
+                    expertFFN(index_->routedExperts[layer][eid], input,
+                              ws_.expertOut.data(), hidden, inter);
+                }
+            } else {
+                expertFFN(index_->routedExperts[layer][eid], input,
+                          ws_.expertOut.data(), hidden, inter);
+            }
         }
-        for (int j = 0; j < hidden; ++j) moeOut[j] += w * expertOut[j];
+
+        float w = topk.weights[i];
+        for (int j = 0; j < hidden; ++j) ws_.moeOut[j] += w * ws_.expertOut[j];
     }
 
     // ---- Shared experts ----
-    std::vector<float> sharedOut(hidden, 0.0f);
+    ensureFloat(ws_.sharedOut, size_t(hidden));
     if (scheduler_) {
         const uint8_t* g = scheduler_->getSharedProjectionPtr(layer, kSharedGateProjSlot);
         const uint8_t* u = scheduler_->getSharedProjectionPtr(layer, kSharedUpProjSlot);
@@ -543,13 +634,13 @@ void GLMForward::moeLayer(int layer, const float* input, float* output) {
         sharedExpertFFNRaw(reinterpret_cast<const BFloat16*>(g),
                            reinterpret_cast<const BFloat16*>(u),
                            reinterpret_cast<const BFloat16*>(d),
-                           input, sharedOut.data(), sharedInter, hidden);
+                           input, ws_.sharedOut.data(), sharedInter, hidden);
     } else {
-        sharedExpertFFN(lw, input, sharedOut.data());
+        sharedExpertFFN(lw, input, ws_.sharedOut.data());
     }
 
     for (int j = 0; j < hidden; ++j) {
-        output[j] = moeOut[j] + sharedOut[j];
+        output[j] = ws_.moeOut[j] + ws_.sharedOut[j];
     }
 }
 
@@ -559,13 +650,13 @@ int GLMForward::lmHeadAndSample(const float* hiddenStates, std::vector<float>* l
     int vocab = cfg.vocabSize;
 
     // Final RMSNorm
-    std::vector<float> normed(hidden);
-    std::memcpy(normed.data(), hiddenStates, hidden * sizeof(float));
+    ensureFloat(ws_.normed, size_t(hidden));
+    std::memcpy(ws_.normed.data(), hiddenStates, hidden * sizeof(float));
     float eps = cfg.rmsNormEps;
     float sqSum = 0.0f;
-    for (int i = 0; i < hidden; ++i) sqSum += normed[i] * normed[i];
+    for (int i = 0; i < hidden; ++i) sqSum += ws_.normed[i] * ws_.normed[i];
     float rms = 1.0f / std::sqrt(sqSum / float(hidden) + eps);
-    for (int i = 0; i < hidden; ++i) normed[i] = normed[i] * rms * finalNorm_[i];
+    for (int i = 0; i < hidden; ++i) ws_.normed[i] = ws_.normed[i] * rms * finalNorm_[i];
 
     // LM Head: logits = lm_head @ hidden
     const BFloat16* lmW = getWeightPtr(index_->lmHead);
@@ -585,7 +676,7 @@ int GLMForward::lmHeadAndSample(const float* hiddenStates, std::vector<float>* l
         #pragma omp for nowait schedule(static)
         for (int v = 0; v < vocab; ++v) {
             const BFloat16* row = lmW + int64_t(v) * hidden;
-            float dot = dotBf16F32(row, normed.data(), hidden);
+            float dot = dotBf16F32(row, ws_.normed.data(), hidden);
             if (logitsOut) (*logitsOut)[v] = dot;
             if (dot > localBestVal) {
                 localBestVal = dot;
@@ -617,48 +708,58 @@ int GLMForward::forward(const std::vector<int>& inputIds, std::vector<float>* lo
     int startTok = (seqLen_ == 0) ? 0 : seqLen_;
     int endTok = int(inputIds.size());
 
+    // Pre-reserve the KV cache for the whole horizon so per-token appends never
+    // reallocate mid-run (item: KV decode-cost reduction).
+    kvCache_.reserve(endTok + 16);
+
+    auto& ws = ws_;
+    ensureFloat(ws.hiddenStates, size_t(hidden));
+    ensureFloat(ws.residual, size_t(hidden));
+    ensureFloat(ws.attnOutL, size_t(hidden));
+    ensureFloat(ws.mlpOut, size_t(hidden));
+
     for (int tok = startTok; tok < endTok; ++tok) {
         int tokenId = inputIds[tok];
         Timer t;
 
         // ---- Embedding lookup ----
-        std::vector<float> hiddenStates(hidden, 0.0f);
+        std::fill(ws.hiddenStates.begin(), ws.hiddenStates.end(), 0.0f);
         const BFloat16* embW = getWeightPtr(index_->embedTokens);
         const BFloat16* embRow = embW + int64_t(tokenId) * hidden;
-        for (int i = 0; i < hidden; ++i) hiddenStates[i] = embRow[i].toF32();
+        for (int i = 0; i < hidden; ++i) ws.hiddenStates[i] = embRow[i].toF32();
 
         // ---- Per-layer forward ----
         // DSA shared top-k selection propagates from "full" to "shared" layers.
         std::vector<int> selSet;
+        selSet.reserve(size_t(std::max(cfg.indexTopk, 1)));
         for (int layer = 0; layer < cfg.numLayers; ++layer) {
             const auto& lw = index_->layers[layer];
 
             // ---- Attention residual: x = x + attention(norm1(x)) ----
-            std::vector<float> residual(hidden);
-            copyVec(residual.data(), hiddenStates.data(), hidden);
+            copyVec(ws.residual.data(), ws.hiddenStates.data(), hidden);
 
-            rmsNorm(lw.inputLayernorm, hiddenStates.data(), hidden);
+            rmsNorm(lw.inputLayernorm, ws.hiddenStates.data(), hidden);
 
-            std::vector<float> attnOut(hidden, 0.0f);
-            attentionLayer(layer, hiddenStates.data(), attnOut.data(), selSet);
+            std::fill(ws.attnOutL.begin(), ws.attnOutL.end(), 0.0f);
+            attentionLayer(layer, ws.hiddenStates.data(), ws.attnOutL.data(), selSet);
             lastTopkByLayer_[layer] = selSet;
 
-            copyVec(hiddenStates.data(), residual.data(), hidden);
-            addVec(hiddenStates.data(), attnOut.data(), hidden);
+            copyVec(ws.hiddenStates.data(), ws.residual.data(), hidden);
+            addVec(ws.hiddenStates.data(), ws.attnOutL.data(), hidden);
 
             // ---- MLP residual: x = x + mlp(norm2(x)) ----
-            copyVec(residual.data(), hiddenStates.data(), hidden);
-            rmsNorm(lw.postAttentionLayernorm, hiddenStates.data(), hidden);
+            copyVec(ws.residual.data(), ws.hiddenStates.data(), hidden);
+            rmsNorm(lw.postAttentionLayernorm, ws.hiddenStates.data(), hidden);
 
-            std::vector<float> mlpOut(hidden, 0.0f);
+            std::fill(ws.mlpOut.begin(), ws.mlpOut.end(), 0.0f);
             if (lw.isMoe) {
-                moeLayer(layer, hiddenStates.data(), mlpOut.data());
+                moeLayer(layer, ws.hiddenStates.data(), ws.mlpOut.data());
             } else {
-                denseMlp(lw, hiddenStates.data(), mlpOut.data());
+                denseMlp(lw, ws.hiddenStates.data(), ws.mlpOut.data());
             }
 
-            copyVec(hiddenStates.data(), residual.data(), hidden);
-            addVec(hiddenStates.data(), mlpOut.data(), hidden);
+            copyVec(ws.hiddenStates.data(), ws.residual.data(), hidden);
+            addVec(ws.hiddenStates.data(), ws.mlpOut.data(), hidden);
         }
 
         // Advance KV cache to include this token (all layers appended)
@@ -666,7 +767,7 @@ int GLMForward::forward(const std::vector<int>& inputIds, std::vector<float>* lo
         seqLen_++;
 
         if (tok == endTok - 1) {
-            int nextToken = lmHeadAndSample(hiddenStates.data(), logitsOut);
+            int nextToken = lmHeadAndSample(ws.hiddenStates.data(), logitsOut);
             GLM_LOG_DEBUG("token " + std::to_string(tok) + " (" +
                           std::to_string(t.elapsedMs()) + " ms) -> " + std::to_string(nextToken));
             return nextToken;
