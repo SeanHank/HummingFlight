@@ -3,7 +3,13 @@ name: ci
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
+
+# The `release` job creates a GitHub Release and uploads assets, which needs
+# write access to the repository contents. Branches/PRs never reach it.
+permissions:
+  contents: write
 
 jobs:
   build-and-gates:
@@ -46,9 +52,50 @@ jobs:
       - name: L6 implementation-completeness audit
         run: python scripts/audit_completeness.py --report
 
+      # Packages are produced for every supported OS, but only for release tags:
+      # branch/PR runs keep the matrix fast.
+      - name: CPack archives (release tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cmake --build build --config Release --target package
+        shell: bash
+
       - name: Upload gate reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gate-reports-${{ matrix.os }}
           path: reports/
+
+      - name: Upload release archives
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-archives-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release (tag gate passed)
+    needs: build-and-gates
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect release archives (all platforms)
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: release-archives-*
+          merge-multiple: true
+
+      - name: Collect gate reports
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: gate-reports-*
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/**
+          generate_release_notes: true

@@ -208,11 +208,13 @@ cd HummingFlight
 
 ## 🧪 Testing & Validation
 
-Every check below is automated and **reproducible**. GitHub-hosted CI runs only
-**Build + L0 + L1 + L6** (runners cannot host the ~1.5 TB checkpoint); the **L2–L5**
-gates (goldens, benchmark, end-to-end) require the real checkpoint and run on the
-model-hosting machine via `python scripts/validate.py --model <dir> --report`.
-The release pipeline refuses to publish until all gates pass. See `doc/design.md`
+Every check below is automated and **reproducible**. GitHub-hosted CI (`ci.yml`)
+runs **Build + L0 + L1 + L6** on Windows, macOS and Linux (runners cannot host the
+~1.5 TB checkpoint); the **L2–L5** gates (goldens, benchmark, end-to-end) require
+the real checkpoint and run on the model-hosting machine via
+`python scripts/validate.py --model <dir> --report`.
+Pushing a `v*` tag runs the gate again on all three OS, packages the archives,
+and **auto-publishes a GitHub Release** once every job passes. See `doc/design.md`
 §10–§11 for the full contract.
 
 | Level | What | Runs without weights? | Command |
@@ -389,8 +391,7 @@ HummingFlight/
 |-- doc/
 |   `-- design.md                   # Design + validation contract (English)
 |-- .github/workflows/
-|   |-- ci.yml                      # Per-PR: build + tests + validation
-|   `-- release.yml                 # Tag: validation gate + packages + release
+|   `-- ci.yml                      # Build + L0/L1/L6 on win/mac/linux; v* tag: gates + CPack + auto-publish GitHub Release
 |-- tools/
 |   |-- tokenizer_server.py         # Tokenizer subprocess service
 |   `-- test_tokenizer.py
