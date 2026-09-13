@@ -61,16 +61,26 @@ jobs:
       - name: Upload gate reports
         if: always()
         uses: actions/upload-artifact@v4
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         with:
           name: gate-reports-${{ matrix.os }}
           path: reports/
+          compression-level: 0
 
+      # Node 24 (default since 2026-06-16) exhausits the ~2GB V8 heap in the
+      # upload-artifact client during uploads; raise the cap + skip its internal
+      # gzip (archives are already compressed) so the mac/windows/linux archives
+      # upload without OOM.
       - name: Upload release archives
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/upload-artifact@v4
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         with:
           name: release-archives-${{ matrix.os }}
           path: dist/
+          compression-level: 0
           if-no-files-found: error
 
   release:
@@ -94,6 +104,8 @@ jobs:
 
       - name: Collect release archives (all platforms)
         uses: actions/download-artifact@v4
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         with:
           path: release
           pattern: release-archives-*
@@ -101,6 +113,8 @@ jobs:
 
       - name: Collect gate reports
         uses: actions/download-artifact@v4
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         with:
           path: release
           pattern: gate-reports-*
