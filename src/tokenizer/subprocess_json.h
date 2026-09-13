@@ -22,7 +22,7 @@ inline std::string escapeJsonString(const std::string& s) {
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
             default:
-                if (unsigned char(c) < 0x20) {
+                if (static_cast<unsigned char>(c) < 0x20) {
                     char buf[8];
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;

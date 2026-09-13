@@ -5,6 +5,14 @@
 
 #if defined(_MSC_VER)
 #include <immintrin.h>
+#define GLM_HAS_SSE 1
+#elif defined(__SSE2__)
+#include <immintrin.h>
+#define GLM_HAS_SSE 1
+#else
+// MSVC without immintrin never occurs on the supported x64 host; GCC/Clang on
+// ARM (Apple Silicon, ARM64 Linux) skip SSE entirely and use the scalar path.
+#define GLM_HAS_SSE 0
 #endif
 
 #ifdef _OPENMP
@@ -112,6 +120,7 @@ void gemv_f32(const float* A, const float* x, float* y,
 
 // ---------- Activation functions ----------
 void relu_f32(float* x, int n) {
+#if GLM_HAS_SSE
     __m128 zero = _mm_setzero_ps();
     int i = 0;
     for (; i + 3 < n; i += 4) {
@@ -119,6 +128,9 @@ void relu_f32(float* x, int n) {
         v = _mm_max_ps(v, zero);
         _mm_storeu_ps(x + i, v);
     }
+#else
+    int i = 0;
+#endif
     for (; i < n; ++i) if (x[i] < 0.0f) x[i] = 0.0f;
 }
 

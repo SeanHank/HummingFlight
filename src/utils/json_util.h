@@ -20,7 +20,7 @@ inline std::string jsonEscapeString(const std::string& s) {
             case '\b': out += "\\b";  break;
             case '\f': out += "\\f";  break;
             default:
-                if (unsigned char(c) < 0x20) {
+                if (static_cast<unsigned char>(c) < 0x20) {
                     char buf[8];
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
