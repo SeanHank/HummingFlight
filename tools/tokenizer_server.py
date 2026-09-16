@@ -24,7 +24,7 @@ import os
 import sys
 
 # Single source of truth: scripts/sync_version.py (do not edit by hand).
-__version__ = "2026.9.0"
+__version__ = "2026.9.1"
 
 # Suppress stderr warnings emitted while importing transformers/torch (e.g. "PyTorch was not found").
 # These warnings would leak into the stdout pipe and interfere with the ready-signal detection on the C++ side.

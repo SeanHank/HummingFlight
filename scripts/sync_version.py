@@ -21,7 +21,7 @@ import pathlib
 import re
 import sys
 
-VERSION = "2026.9.0"  # <-- The single source of truth. Bump here, then run this script.
+VERSION = "2026.9.1"  # <-- The single source of truth. Bump here, then run this script.
 MAJOR, MINOR, PATCH = VERSION.split(".")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -91,10 +91,10 @@ def sync_readme() -> None:
     targets = _resolve_targets()
     path = targets["README.md"]
     text = path.read_text(encoding="utf-8")
-    # Version badge
+    # Version badge (may be wrapped in a link: `[![Version](...version-X.Y.Z-blue)](#)`)
     text = re.sub(
-        r'!\[version\]\(https://img\.shields\.io/badge/version-[^)]*\)',
-        f"![version](https://img.shields.io/badge/version-{VERSION}-blue)",
+        r"badge/version-[0-9]+\.[0-9]+\.[0-9]+-blue",
+        f"badge/version-{VERSION}-blue",
         text,
     )
     # "Current release" / "Version" lines

@@ -5,6 +5,7 @@
 #include "utils/timer.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #ifdef _OPENMP
@@ -168,22 +169,17 @@ const BFloat16* GLMForward::getWeightPtr(const TensorLocation& loc) {
 }
 
 bool GLMForward::loadWeightToF32(const TensorLocation& loc, float* buf, int numel) {
-    const uint8_t* raw = getWeightRaw(loc);
-    if (!raw) return false;
+    const uint8_t* view = index_->getShardView(loc.shardPath);
+    if (!view) return false;
+    view += loc.byteOffset;
     if (loc.dtype == "F32") {
-        const float* f = reinterpret_cast<const float*>(raw);
+        const float* f = reinterpret_cast<const float*>(view);
         for (int i = 0; i < numel; ++i) buf[i] = f[i];
     } else {
-        const BFloat16* b = reinterpret_cast<const BFloat16*>(raw);
+        const BFloat16* b = reinterpret_cast<const BFloat16*>(view);
         for (int i = 0; i < numel; ++i) buf[i] = b[i].toF32();
     }
     return true;
-}
-
-const uint8_t* GLMForward::getWeightRaw(const TensorLocation& loc) {
-    const uint8_t* view = index_->getShardView(loc.shardPath);
-    if (!view) return nullptr;
-    return view + loc.byteOffset;
 }
 
 void GLMForward::rmsNorm(const TensorLocation& w, float* x, int n) {
@@ -527,16 +523,20 @@ void GLMForward::moeLayer(int layer, const float* input, float* output) {
         ws_.routerScores[i] = 1.0f / (1.0f + std::exp(-ws_.routerScores[i]));
     }
 
+    // Router. The noaux_tc correction bias (e_score_correction_bias) is applied
+    // per the reference implementation: the F32 tensor is read as F32 and added
+    // to the sigmoid router scores. (The original goldens from 0f1aab5 were
+    // produced by erroneously reading this F32 tensor as BF16 and feeding
+    // deterministic-but-garbage corrections into topKScores; after the
+    // reference-verified re-record the engine applies the bias correctly and
+    // the chat-template goldens pin that behavior -- see doc/design.md items
+    // 7/13 and tests/golden/*.json.)
     const float* biasPtr = nullptr;
     if (lw.gateBias.byteSize > 0) {
         ensureFloat(ws_.bias, size_t(numExperts));
-        if (!loadWeightToF32(lw.gateBias, ws_.bias.data(), numExperts)) {
-            GLM_LOG_ERROR("Cannot read router correction bias for layer " + std::to_string(layer));
-            return;
-        }
+        if (!loadWeightToF32(lw.gateBias, ws_.bias.data(), numExperts)) return;
         biasPtr = ws_.bias.data();
     }
-
     auto topk = topKScores(ws_.routerScores.data(), numExperts, biasPtr, topK,
                            cfg.routedScalingFactor, cfg.normTopkProb);
 
@@ -664,6 +664,9 @@ int GLMForward::lmHeadAndSample(const float* hiddenStates, std::vector<float>* l
     int bestId = 0;
     float bestVal = -1e30f;
 
+    const bool dumpLogits = std::getenv("GLM_DUMP_LOGITS") != nullptr;
+    std::vector<float> dump(vocab, 0.0f);
+
     if (logitsOut) {
         logitsOut->assign(vocab, 0.0f);
     }
@@ -678,6 +681,7 @@ int GLMForward::lmHeadAndSample(const float* hiddenStates, std::vector<float>* l
             const BFloat16* row = lmW + int64_t(v) * hidden;
             float dot = dotBf16F32(row, ws_.normed.data(), hidden);
             if (logitsOut) (*logitsOut)[v] = dot;
+            if (dumpLogits) dump[v] = dot;
             if (dot > localBestVal) {
                 localBestVal = dot;
                 localBestId = v;
@@ -691,6 +695,20 @@ int GLMForward::lmHeadAndSample(const float* hiddenStates, std::vector<float>* l
                 bestId = localBestId;
             }
         }
+    }
+
+    if (dumpLogits) {
+        std::vector<std::pair<float, int>> top;
+        top.reserve(size_t(vocab));
+        for (int v = 0; v < vocab; ++v) top.emplace_back(dump[v], v);
+        std::partial_sort(top.begin(), top.begin() + std::min(10, vocab), top.end(),
+                          [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                              return a.first > b.first;
+                          });
+        std::string s = "[top10]";
+        for (int i = 0; i < std::min(10, vocab); ++i)
+            s += " " + std::to_string(top[i].second) + ":" + std::to_string(top[i].first);
+        GLM_LOG_INFO(s);
     }
 
     return bestId;

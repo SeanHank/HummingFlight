@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # PROJECT_VERSION is synchronized by scripts/sync_version.py (single source of truth).
 project(glm52_local
-    VERSION 2026.9.0
+    VERSION 2026.9.1
     DESCRIPTION "GLM-5.2 local full inference engine (BF16, original implementation inspired by colibri)"
     LANGUAGES CXX
 )
@@ -189,7 +189,7 @@ install(TARGETS glm RUNTIME DESTINATION bin)
 
 # ---------- Packaging (CPack) ----------
 set(CPACK_PACKAGE_NAME "HummingFlight")
-set(CPACK_PACKAGE_VERSION 2026.9.0) # synchronized by scripts/sync_version.py
+set(CPACK_PACKAGE_VERSION 2026.9.1) # synchronized by scripts/sync_version.py
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "GLM-5.2 local full inference engine (BF16)")
 set(CPACK_PACKAGE_VENDOR "HummingFlight")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")

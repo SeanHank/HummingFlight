@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Project version | `2026.9.0` |
+| Project version | `2026.9.1` |
 | Platform | `Windows-10-10.0.19044-SP0` |
 | Python | `3.13.5` |
-| Timestamp (UTC) | `2026-09-13T12:52:54Z` |
+| Timestamp (UTC) | `2026-09-15T22:52:23Z` |
 
 ## Marker scan
 

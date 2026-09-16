@@ -474,7 +474,7 @@ int main(int argc, char** argv) {
     } else if (useTokenizer) {
         // Resolve script path: --script > executable dir > CWD
         std::string scriptPath;
-        if (args.promptTokens.empty()) {
+        if (!args.promptTokens.empty()) {
             scriptPath = "";
         } else if (!args.scriptPath.empty() && std::filesystem::exists(args.scriptPath)) {
             scriptPath = std::filesystem::canonical(args.scriptPath).string();

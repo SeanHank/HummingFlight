@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Project version | `2026.9.0` |
+| Project version | `2026.9.1` |
 | Platform | `Windows-10-10.0.19044-SP0` |
-| Python | `3.11.15` |
-| Timestamp (UTC) | `2026-09-12T23:31:40Z` |
+| Python | `3.13.5` |
+| Timestamp (UTC) | `2026-09-14T22:50:40Z` |
 
 ## Quality gates (require 100% PASS; model-present SKIPs fail the release)
 

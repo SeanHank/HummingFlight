@@ -33,10 +33,12 @@ GOLDEN_DIR = TESTS / "golden"
 
 # Fixed prompts + token counts. Keep tokens small (verify cheaply).
 # The first entry is the canonical smoke prompt used everywhere (validate.py,
-# package.py, CI). Raw encoding (--raw) keeps output deterministic.
+# package.py, CI). Chat-template encoding (no --raw) exercises the full stack
+# including the model's default system prompt, so the model emits a real
+# completion instead of an immediate EOS on a bare raw prompt.
 DEFAULT_CASES = [
-    {"name": "smoke", "prompt": "hi", "max_tokens": 1},
-    {"name": "greeting", "prompt": "Hello", "max_tokens": 4},
+    {"name": "smoke", "prompt": "hi", "max_tokens": 1, "raw": False},
+    {"name": "greeting", "prompt": "Hello", "max_tokens": 4, "raw": False},
 ]
 
 
@@ -57,11 +59,20 @@ def record(args: argparse.Namespace) -> int:
     for case in cases:
         prompt = case["prompt"]
         max_tokens = int(case.get("max_tokens", 1))
-        print(f"Recording golden [{case['name']}] prompt={prompt!r} tokens={max_tokens} ...")
-        code, out = run_capture([
-            str(exe), "--model", model_dir, "--prompt", prompt,
-            "--raw", "--max-tokens", str(max_tokens), "--python", args.python,
-        ])
+        raw = bool(case.get("raw", False))
+        prompt_tokens = case.get("prompt_tokens")
+        if prompt_tokens:
+            cmd = [str(exe), "--model", model_dir, "--prompt-tokens",
+                   ",".join(str(x) for x in prompt_tokens),
+                   "--max-tokens", str(max_tokens)]
+        else:
+            cmd = [str(exe), "--model", model_dir, "--prompt", prompt,
+                   "--max-tokens", str(max_tokens)]
+            if raw:
+                cmd += ["--raw"]
+        print(f"Recording golden [{case['name']}] prompt={prompt!r} tokens={max_tokens} "
+              f"raw={raw} ...")
+        code, out = run_capture(cmd + ["--python", args.python])
         if code != 0:
             print(f"ERROR: engine exited with {code}:\n{out[-800:]}")
             return 1
@@ -80,11 +91,13 @@ def record(args: argparse.Namespace) -> int:
             "name": case["name"],
             "prompt": prompt,
             "max_tokens": max_tokens,
-            "raw": True,
+            "raw": raw,
             "version": project_version(),
             "signature": model_dna(model_dir),
             "tokens": tokens,
         }
+        if prompt_tokens:
+            record["prompt_tokens"] = list(prompt_tokens)
         out_path = GOLDEN_DIR / f"{case['name']}.json"
         out_path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n",
                             encoding="utf-8")

@@ -1,9 +1,38 @@
 {
-  "version": "2026.9.0",
+  "version": "2026.9.1",
   "model_dir": "E:\\glm-5.2-bf16",
   "metrics": {
     "generated_tokens": 4,
-    "total_sec": 5875.710399,
-    "speed_tok_per_s": 0.000681
+    "total_sec": 12030.37161,
+    "speed_tok_per_s": 0.000332,
+    "telemetry": {
+      "generated_sec": 12030.4,
+      "cpu_utilization": 1,
+      "gpu_utilization": 0,
+      "pcie_utilization": 0,
+      "gpu_active_ms": 0,
+      "pcie_bytes": 0,
+      "expert_lookups": 3600,
+      "expert_lru_hits": 755,
+      "expert_lru_misses": 2845,
+      "expert_disk_loads": 2845,
+      "expert_cache_hit_rate": 0.209722,
+      "expert_cache_miss_rate": 0.790278,
+      "prefetch_submitted": 3840,
+      "prefetch_inserted": 4840,
+      "prefetch_wasted": 2685,
+      "prefetch_delivery_rate": 1.26042,
+      "prefetch_waste_rate": 0.699219,
+      "disk_bytes_read": 298366009344,
+      "sequential_bytes": 298366009344,
+      "random_io_count": 3840,
+      "io_read_count": 3840,
+      "bytes_read_per_token": 74591500000.0,
+      "sequential_bytes_per_token": 74591500000.0,
+      "hdd_latency_ms": 3718.48,
+      "ram_bandwidth_mbps": 39.2952,
+      "pcie_transfer_gbps": 0,
+      "expert_reuse_distance_tok": 108.692
+    }
   }
 }

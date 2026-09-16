@@ -110,16 +110,11 @@ private:
     // RoPE (decoupled, interleave mode)
     void applyRoPE(float* x, int dim, int pos, int offset, bool interleave);
 
-    // Load numel elements of a tensor into a float buffer, honoring the tensor's
-    // declared dtype (BF16, or F32 -- GLM-5.2 stores the noaux_tc router
-    // score-correction bias as float32 per config moe_router_dtype=float32).
-    bool loadWeightToF32(const TensorLocation& loc, float* buf, int numel);
-
-    // Raw mmap view of a tensor's data (dtype-agnostic).
-    const uint8_t* getWeightRaw(const TensorLocation& loc);
-
     // Get BF16 pointer directly from TensorLocation (mmap view)
     const BFloat16* getWeightPtr(const TensorLocation& loc);
+
+    // Copy a tensor's values into a float buffer handling F32 vs BF16 dtype.
+    bool loadWeightToF32(const TensorLocation& loc, float* buf, int numel);
 
     // Final norm + LM head. Greedy argmax or full logits output.
     int lmHeadAndSample(const float* hiddenStates, std::vector<float>* logitsOut);

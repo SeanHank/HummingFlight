@@ -986,7 +986,8 @@ int validateWeights(const std::string& modelDir, std::string& report) {
     }
     std::snprintf(buf, sizeof(buf),
                   "structural: dense=%d moe=%d full-indexer=%d routed-experts-validated=%llu "
-                  "(all shape-vs-config)\n",
+                  "(all shape-vs-config); noaux_tc bias validated-present but not applied "
+                  "on the greedy forward (golden contract, doc/design.md items 7/13)\n",
                   nDense, nMoe, nFullIdx, (unsigned long long)expertsValidated);
     report += buf;
 

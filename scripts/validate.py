@@ -194,10 +194,20 @@ def check_golden(report: MarkdownReport, model_dir: str, exe: pathlib.Path,
             report.check(f"L3 golden {gf.name}", "SKIP",
                          f"model signature mismatch: golden={recorded_sig}, model={sig}")
             continue
-        cmd = [str(exe), "--model", model_dir, "--prompt", prompt,
-               "--raw", "--max-tokens", str(len(expected))]
-        if python:
-            cmd += ["--python", python]
+        tokens_override = data.get("prompt_tokens")
+        if tokens_override:
+            cmd = [str(exe), "--model", model_dir,
+                   "--prompt-tokens", ",".join(str(x) for x in tokens_override),
+                   "--max-tokens", str(len(expected))]
+            if python:
+                cmd += ["--python", python]
+        else:
+            cmd = [str(exe), "--model", model_dir, "--prompt", prompt,
+                   "--max-tokens", str(len(expected))]
+            if data.get("raw", True):
+                cmd += ["--raw"]
+            if python:
+                cmd += ["--python", python]
         code, out = run_capture(cmd)  # no timeout: forward passes span hours
         got: list[int] = []
         for line in out.splitlines():

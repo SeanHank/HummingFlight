@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/platform-Win%2010%2B%20macOS%2014%2B%20Linux-lightgrey.svg)](#)
 [![Language](https://img.shields.io/badge/C%2B%2B-20-orange.svg)](#)
 [![Precision](https://img.shields.io/badge/precision-BF16%20lossless-success.svg)](#)
-[![Version](https://img.shields.io/badge/version-2026.9.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-2026.9.1-blue)](#)
 
 A from-scratch C++ inference engine that loads and runs the **complete GLM-5.2** model on consumer-grade hardware. No quantization. No approximation. No GPU farm.
 
@@ -181,8 +181,8 @@ cd HummingFlight
 # Unlimited generation (stops on EOS token)
 .\build\Release\glm.exe --model "E:\glm-5.2-bf16" --prompt "Explain quantum entanglement."
 
-# Quick validation -- fastest path (raw encode, 1 token)
-.\build\Release\glm.exe --model "E:\glm-5.2-bf16" --prompt "hi" --raw --max-tokens 1
+# Quick validation -- chat template, 1 generated token
+.\build\Release\glm.exe --model "E:\glm-5.2-bf16" --prompt "hi" --max-tokens 1
 
 # Debug mode -- per-layer timing
 .\build\Release\glm.exe --model "E:\glm-5.2-bf16" --prompt "Hello" --max-tokens 8 --verbose
@@ -297,16 +297,16 @@ Per-token breakdown (generation, RAM-cached):
 
 ### MoE Routing: noaux_tc Top-K
 
-GLM-5.2 uses load-balancing-aware routing. For each token, the router scores all 256 experts via sigmoid, applies a frequency bias, and selects the top 8:
+GLM-5.2 uses load-balancing-aware routing. For each token, the router scores all 256 experts via sigmoid, adds the per-expert learned correction bias (`e_score_correction_bias`, stored F32), and selects the top 8:
 
 ```cpp
 // Affinity scores
 for (int e = 0; e < 256; ++e)
     scores[e] = sigmoid(dot(hidden, routerWeight[e]));
 
-// noaux_tc bias: down-weight overused experts
+// noaux_tc bias: add the F32 per-expert score-correction tensor
 for (int e = 0; e < 256; ++e)
-    scores[e] -= bias[e];
+    scores[e] += bias[e];
 
 // Top-8 selection + weight normalization
 topK(scores, 8, selectedExperts, selectedWeights);
