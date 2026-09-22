@@ -21,7 +21,7 @@ import pathlib
 import re
 import sys
 
-VERSION = "2026.9.1"  # <-- The single source of truth. Bump here, then run this script.
+VERSION = "2026.9.2"  # <-- The single source of truth. Bump here, then run this script.
 MAJOR, MINOR, PATCH = VERSION.split(".")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent

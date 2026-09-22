@@ -1,6 +1,6 @@
 # HummingFlight — Local Full-Weight GLM-5.2 Inference Engine — Design Document
 
-> **Project version**: 2026.9.1
+> **Project version**: 2026.9.2
 >
 > Goal: run the **complete GLM-5.2 BF16 model (~1.5 TB, no quantization)** on a single
 > consumer machine. Reference model

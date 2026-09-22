@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/platform-Win%2010%2B%20macOS%2014%2B%20Linux-lightgrey.svg)](#)
 [![Language](https://img.shields.io/badge/C%2B%2B-20-orange.svg)](#)
 [![Precision](https://img.shields.io/badge/precision-BF16%20lossless-success.svg)](#)
-[![Version](https://img.shields.io/badge/version-2026.9.1-blue)](#)
+[![Version](https://img.shields.io/badge/version-2026.9.2-blue)](#)
 
 A from-scratch C++ inference engine that loads and runs the **complete GLM-5.2** model on consumer-grade hardware. No quantization. No approximation. No GPU farm.
 
