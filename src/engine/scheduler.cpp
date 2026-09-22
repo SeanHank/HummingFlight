@@ -14,6 +14,20 @@ namespace {
 
 constexpr int kPinThreshold = 5;  // routing accesses before an LRU learn-in (learned pin)
 
+// O2 (doc/design.md 17.2): speculative prefetch budget. Once this many expert
+// assemblies are being streamed no further speculative I/O is issued, so the
+// critical-path demand reads never wait behind an unbounded speculative queue
+// (on HDD this bounded the measured 3718 ms queue-latency inflation and trims
+// the ~70% prefetch waste). Soft cap; a stray concurrent caller may overshoot
+// by one batch, which is harmless.
+constexpr size_t kMaxPrefetchInFlight = 40;
+
+// O3 (doc/design.md 17.2): maximum inter-projection gap (bytes) tolerated when
+// coalescing same-shard reads into one run. Projections separated by <= this are
+// merged into a single I/O request; the padding is read but never copied into an
+// assembly, so merged runs stay byte-identical and only the seek count drops.
+constexpr uint64_t kRunMergeGap = 1ULL * 1024 * 1024;
+
 TensorLocation sharedSlotLoc(const LayerWeights& lw, uint16_t slot) {
     switch (slot) {
         case kSharedGateProjSlot: return lw.sharedGateProj;
@@ -266,6 +280,13 @@ void Scheduler::onLayerRouterDone(int layer, const std::vector<int>& topKExperts
 void Scheduler::prefetchAsync(const std::vector<std::pair<int, int>>& experts) {
     if (!index_) return;
 
+    // O2 backpressure: skip speculation entirely while the prefetch pipeline is
+    // already saturated (demand reads keep their disk priority).
+    {
+        std::lock_guard<std::mutex> guard(inFlightMtx_);
+        if (prefetchedInFlight_.size() >= kMaxPrefetchInFlight) return;
+    }
+
     std::unordered_map<std::string, std::vector<ProjectionIO>> byShard;
     std::unordered_map<ExpertKey, std::shared_ptr<Assembly>, ExpertKeyHash> assemblies;
 
@@ -342,7 +363,10 @@ void Scheduler::prefetchAsync(const std::vector<std::pair<int, int>>& experts) {
         std::shared_ptr<Run> run = std::make_shared<Run>();
         run->shard = shard;
         for (const auto& io : ios) {
-            if (run->slices.empty() || io.offset > run->end) {
+            // O3: coalesce any projection whose gap to the current run is within
+            // kRunMergeGap; the padding bytes are read but never memcpy'd into an
+            // assembly, so expert bytes and forward math stay bit-identical.
+            if (run->slices.empty() || io.offset > run->end + kRunMergeGap) {
                 // New run starts.
                 run = std::make_shared<Run>();
                 run->shard = shard;

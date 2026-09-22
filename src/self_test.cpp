@@ -770,14 +770,20 @@ void testAdaptiveConfig() {
 
     AdaptiveConfig c0 = computeAdaptiveConfig(cpuHost, {});
     CHECK(c0.gpu == GpuBackend::None, "Adaptive: no GPU -> CPU backend");
-    CHECK(c0.lruBytes >= 256ULL * 1024 * 1024 && c0.lruBytes <= (16 * GiB) / 4,
-          "Adaptive: LRU capped at 25% RAM");
+    CHECK(c0.lruBytes >= 256ULL * 1024 * 1024 && c0.lruBytes == (16 * GiB) * 3 / 5,
+          "Adaptive: LRU window sized from RAM (3/5 rule, O1)");
     CHECK(c0.ramBudgetBytes >= c0.lruBytes, "Adaptive: RAM budget >= LRU");
     CHECK(c0.ramBudgetBytes <= 16 * GiB, "Adaptive: RAM budget within physical RAM");
     CHECK(c0.vramBudgetBytes == 0, "Adaptive: no VRAM budget on CPU-only host");
     CHECK(c0.iocpWorkers >= 1 && c0.iocpWorkers <= 8 &&
           c0.iocpWorkers == std::min(8, std::max(2, 8 / 4)),
           "Adaptive: IOCP workers scaled from cores");
+
+    // O1: large-RAM CPU-only hosts hit the 40 GiB LRU cap (one forward footprint).
+    SystemProfile bigHost = cpuHost;
+    bigHost.ramBytes = 128 * GiB;
+    AdaptiveConfig cBig = computeAdaptiveConfig(bigHost, {});
+    CHECK(cBig.lruBytes == 40 * GiB, "Adaptive: CPU LRU capped at 40 GiB (O1)");
 
     // NVIDIA RTX 3060 6 GiB host: dedicated VRAM budget keeps a driver reserve.
     SystemProfile nvidiaHost = cpuHost;

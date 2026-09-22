@@ -285,18 +285,26 @@ AdaptiveConfig computeAdaptiveConfig(const SystemProfile& profile,
         lru = overrides.lruBytes;
         c.hasOverrides = true;
     } else {
-        // 25% of physical RAM as the resident expert window; unified-memory
-        // machines (MPS) can afford a larger share.
-        uint64_t cap = unified ? 96ULL * kGiB : 64ULL * kGiB;
-        lru = std::max<uint64_t>(256ULL * kMiB, std::min<uint64_t>(ram / 4, cap));
+        // Route-window sizing (O1, doc/design.md 17.2): one forward touches ~27-30 GB
+        // of distinct routed experts + shared projections. The former RAM/4 window
+        // (~16 GB on a 64 GB host) was smaller than a single forward's footprint, so
+        // it thrashed *within* a forward and every token re-streamed the expert set
+        // (measured 21% LRU hit, 69.5 GiB/token -- see doc/design.md 17.1). Size the
+        // window from RAM so the whole per-forward footprint stays resident and
+        // carries over across tokens. CPU-only: min(RAM*3/5, 40 GiB); unified-memory
+        // (MPS) hosts can afford a larger share.
+        uint64_t cap = unified ? 96ULL * kGiB : 40ULL * kGiB;
+        uint64_t share = unified ? 3 * ram / 4 : 3 * ram / 5;
+        lru = std::max<uint64_t>(256ULL * kMiB, std::min<uint64_t>(share, cap));
     }
     const uint64_t reserve = osReserveBytes(ram);
     c.lruBytes = reserve >= ram ? lru : std::min<uint64_t>(lru, ram - reserve);
     c.lruBytes = std::max<uint64_t>(256ULL * kMiB, c.lruBytes);
 
-    // Placement RAM budget: up to 50% of RAM, never below the LRU, never above
-    // RAM minus the OS/Python reserve.
-    uint64_t budget = std::max<uint64_t>(ram / 2, c.lruBytes * 2);
+    // Placement RAM budget: 80% of RAM or 1.5x the LRU window, never below the LRU,
+    // never above RAM minus the OS/Python reserve. Informational cap only (the LRU
+    // is the actual memory consumer).
+    uint64_t budget = std::max<uint64_t>(4 * ram / 5, c.lruBytes + c.lruBytes / 2);
     c.ramBudgetBytes = reserve >= ram ? c.lruBytes : std::min<uint64_t>(budget, ram - reserve);
     c.ramBudgetBytes = std::max<uint64_t>(c.ramBudgetBytes, c.lruBytes);
 

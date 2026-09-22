@@ -222,7 +222,7 @@ release, publishing is skipped. See `doc/design.md`
 
 | Level | What | Runs without weights? | Command |
 |---|---|---|---|
-| L0 | Functional self-tests (BF16, GEMV incl. ILP-unrolled kernels, RMSNorm, softmax, sigmoid, top-K router, compressed-MLA KV cache incl. reserve + head-major layout, LRU incl. soft-boost, placement, config parser incl. MTP + GLM-5.2 nextn keys, sampler incl. min-p + repetition/frequency/presence penalties + typical-p + 13-arg equivalence, adaptive runtime config, strict safetensors validation incl. data alignment + F32 allow-list for the router bias, item-7 structural completeness, weight-index MTP detection — 162 checks) | ✅ | `build\Release\glm_tests.exe` or `glm.exe --self-test` |
+| L0 | Functional self-tests (BF16, GEMV incl. ILP-unrolled kernels, RMSNorm, softmax, sigmoid, top-K router, compressed-MLA KV cache incl. reserve + head-major layout, LRU incl. soft-boost, placement, config parser incl. MTP + GLM-5.2 nextn keys, sampler incl. min-p + repetition/frequency/presence penalties + typical-p + 13-arg equivalence, adaptive runtime config, strict safetensors validation incl. data alignment + F32 allow-list for the router bias, item-7 structural completeness, weight-index MTP detection — 163 checks) | ✅ | `build\Release\glm_tests.exe` or `glm.exe --self-test` |
 | L1 | Python contract tests (version consistency, fixtures, golden contract, binary black-box incl. strict opt-in errors, benchmark STATS/telemetry parser, native tokenizer parity — 28 tests) | ✅ | `python -m pytest tests/ -v` |
 | L2 | Structural model validation (index, shards, tensor layout, per-layer completeness, per-expert gate/up/down + shape-vs-config, MTP config consistency — 0 failures on the real GLM-5.2 checkpoint) | needs model | `glm.exe --check-weights --model <dir>` |
 | L3 | Golden inference outputs (greedy token ids, byte-for-byte) | needs model | `python scripts/record_golden.py --model <dir>` then `scripts/validate.py --model <dir>` |
@@ -267,16 +267,24 @@ Project governance documents:
 
 ## Performance
 
-Benchmarked on **AMD Ryzen 7 5800H (8C/16T) - 64 GB RAM - 5 TB HDD** (model on HDD):
+Benchmarked on **AMD Ryzen 7 5800H (8C/16T) - 64 GB RAM - 5 TB HDD** (model on HDD).
 
-| Phase | Per-Token | Notes |
+**Measured 2026-09 (L4 gate, exact engine telemetry) -- see [reports/benchmark_report.md](reports/benchmark_report.md):**
+
+| Metric | Baseline (before I/O round) | Optimized (O1+O2+O3) |
 |---|---|---|
-| Prefill (1st token) | ~1,900 s | Cold-start, loading 1.5 TB into RAM |
-| Prefill (subsequent) | ~680 s | Weights cached, CPU-bound |
-| Generation | ~680 s / token | Same -- no expert reuse across tokens |
+| Speed (4 tokens, prompt ids 3,7,12) | 0.00033 tok/s (12 030 s) | 0.00041 tok/s (9 849 s) |
+| Auto LRU window | 15.7 GiB (RAM/4) | 38.6 GiB (`min(RAM·⅗, 40 GiB)`) |
+| Disk bytes / token | 69.5 GiB | 69.5 GiB (cold worst case) |
+| Generated output | `16,29661,90,77` | `16,29661,90,77` (**bit-identical**) |
 
-**Throughput**: ~0.0015 tok/s
-
+> The L4 workload uses a *random 3-id prompt*, so each batch position routes to almost-disjoint
+> experts -- a cold worst case whose bytes/token is structurally fixed regardless of cache size.
+> On real chat workloads (routing locality, tokens within the ~108-token reuse distance) the
+> 2.5× LRU window keeps repeated experts resident. The optimization round is **I/O-layer only**:
+> it changes *when/how* bytes are fetched, never *which* bytes land in an expert, so all golden
+> and benchmark outputs stay bit-identical. See **doc/design.md §17** for the full analysis.
+> 
 > Yes, it's slow. That's the price of running 1.5 TB from an HDD without quantization. The goal is **fidelity**, not throughput. With an NVMe SSD: 5-10x faster. With 128 GB RAM: most experts stay cached.
 
 ### Where Does the Time Go?
