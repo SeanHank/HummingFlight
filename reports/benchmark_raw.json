@@ -1,12 +1,12 @@
 {
-  "version": "2026.9.1",
+  "version": "2026.9.2",
   "model_dir": "E:\\glm-5.2-bf16",
   "metrics": {
     "generated_tokens": 4,
-    "total_sec": 9849.070608,
-    "speed_tok_per_s": 0.000406,
+    "total_sec": 17685.303505,
+    "speed_tok_per_s": 0.000226,
     "telemetry": {
-      "generated_sec": 9849.07,
+      "generated_sec": 17685.3,
       "cpu_utilization": 1,
       "gpu_utilization": 0,
       "pcie_utilization": 0,
@@ -29,8 +29,8 @@
       "io_read_count": 3840,
       "bytes_read_per_token": 74591500000.0,
       "sequential_bytes_per_token": 74591500000.0,
-      "hdd_latency_ms": 3698.68,
-      "ram_bandwidth_mbps": 47.9981,
+      "hdd_latency_ms": 3770.83,
+      "ram_bandwidth_mbps": 26.7305,
       "pcie_transfer_gbps": 0,
       "expert_reuse_distance_tok": 108.692
     }

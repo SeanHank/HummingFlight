@@ -2,10 +2,10 @@
 
 | Field | Value |
 |---|---|
-| Project version | `2026.9.1` |
+| Project version | `2026.9.2` |
 | Platform | `Windows-10-10.0.19044-SP0` |
 | Python | `3.13.5` |
-| Timestamp (UTC) | `2026-09-15T22:52:07Z` |
+| Timestamp (UTC) | `2026-09-23T13:06:19Z` |
 
 - `PASS` **L5 build artifacts** -- C:\Users\Administrator\Documents\PyCharm\HummingFlight\build\Release\glm.exe
 - `PASS` **L5 real-model directory** -- E:\glm-5.2-bf16
