@@ -604,6 +604,22 @@ void GLMForward::moeLayer(int layer, const float* input, float* output) {
             int eid = topk.indices[i];
             float w = topk.weights[i];
             if (scheduler_) {
+                // O12 (doc/design.md 17.11): issue the NEXT expert's read now so
+                // its ~72 MB disk read overlaps this expert's FFN compute instead
+                // of running strictly after it. Purely a *when* change: same
+                // experts, same order, same kernels, same accumulation order, so
+                // the result is bit-identical.
+                //
+                // O13b (doc/design.md 17.12): two slots instead of one, because
+                // onLayerRouterDone now fires only a 2-expert primer and this
+                // look-ahead has to pull the rest just-in-time. One slot left the
+                // drive with only one read queued per ~0.8 s of compute, which
+                // re-exposed the bulk/submit-order coupling at a smaller scale;
+                // two slots keeps ~3 reads in flight (primer + 2), the K=2-3
+                // depth readprobe6 measured as both fastest and most stable.
+                for (int ahead = 1; ahead <= 2 && i + ahead < numExperts; ++ahead) {
+                    scheduler_->prefetchExpert(layer, topk.indices[i + ahead]);
+                }
                 const uint8_t* eptr = scheduler_->getExpertPtr(layer, eid);
                 if (eptr) {
                     const BFloat16* eG = reinterpret_cast<const BFloat16*>(eptr);

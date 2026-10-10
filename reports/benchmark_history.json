@@ -1,0 +1,180 @@
+{
+  "records": {
+    "--prompt-tokens 3,7,12 --max-tokens 4|Baseline": {
+      "label": "Baseline",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 12030.37,
+      "speed_tok_per_s": 0.000332,
+      "disk_bytes_read": null,
+      "sync_bytes": null,
+      "total_disk_bytes": null,
+      "prefetch_waste_rate": 0.6992,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R1": {
+      "label": "R1",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 9849.07,
+      "speed_tok_per_s": 0.000406,
+      "disk_bytes_read": null,
+      "sync_bytes": null,
+      "total_disk_bytes": null,
+      "prefetch_waste_rate": 0.6633,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R2": {
+      "label": "R2",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 8667.82,
+      "speed_tok_per_s": 0.000461,
+      "disk_bytes_read": null,
+      "sync_bytes": null,
+      "total_disk_bytes": null,
+      "prefetch_waste_rate": 0.317,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R3": {
+      "label": "R3",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 7572.95,
+      "speed_tok_per_s": 0.000528,
+      "disk_bytes_read": 342003548160,
+      "sync_bytes": null,
+      "total_disk_bytes": 342003548160,
+      "prefetch_waste_rate": 0.0893,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R4": {
+      "label": "R4",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 7103.63227,
+      "speed_tok_per_s": 0.000563,
+      "disk_bytes_read": 300253446144,
+      "sync_bytes": null,
+      "total_disk_bytes": 300253446144,
+      "prefetch_waste_rate": 0.0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R5-widemerge": {
+      "label": "R5-widemerge",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 7219.38121,
+      "speed_tok_per_s": 0.000554,
+      "disk_bytes_read": 303877324800,
+      "sync_bytes": 3019898880,
+      "total_disk_bytes": 306897223680,
+      "prefetch_waste_rate": 0.0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R5": {
+      "label": "R5",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 6684.179613,
+      "speed_tok_per_s": 0.000598,
+      "disk_bytes_read": 306897223680,
+      "sync_bytes": 0,
+      "total_disk_bytes": 306897223680,
+      "prefetch_waste_rate": 0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R6": {
+      "label": "R6",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 6781.376757,
+      "speed_tok_per_s": 0.00059,
+      "disk_bytes_read": 306897223680,
+      "sync_bytes": 0,
+      "total_disk_bytes": 306897223680,
+      "prefetch_waste_rate": 0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|R6-revert": {
+      "label": "R6-revert",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 6984.419813,
+      "speed_tok_per_s": 0.000573,
+      "disk_bytes_read": 306897223680,
+      "sync_bytes": 0,
+      "total_disk_bytes": 306897223680,
+      "prefetch_waste_rate": 0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|unlabelled": {
+      "label": "unlabelled",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 6995.504731,
+      "speed_tok_per_s": 0.000572,
+      "disk_bytes_read": 306897223680,
+      "sync_bytes": 0,
+      "total_disk_bytes": 306897223680,
+      "prefetch_waste_rate": 0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    },
+    "--prompt-tokens 3,7,12 --max-tokens 4|release": {
+      "label": "release",
+      "config": "--prompt-tokens 3,7,12 --max-tokens 4",
+      "total_sec": 6922.836242,
+      "speed_tok_per_s": 0.000578,
+      "disk_bytes_read": 306897223680,
+      "sync_bytes": 0,
+      "total_disk_bytes": 306897223680,
+      "prefetch_waste_rate": 0,
+      "output_ids": [
+        16,
+        29661,
+        90,
+        77
+      ]
+    }
+  }
+}

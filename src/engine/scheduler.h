@@ -83,6 +83,13 @@ public:
     // [gate_proj | up_proj | down_proj], each BF16. Returns nullptr on error.
     const uint8_t* getExpertPtr(int layer, int expertId);
 
+    // O12 (doc/design.md 17.11): non-blocking read-ahead for one expert. Issues
+    // the same demand-stage prefetchAsync would issue on a getter miss, but
+    // returns immediately, so the caller can overlap the disk read with its own
+    // compute and let the later getExpertPtr() find the assembly in flight.
+    // Purely a *when* change: identical bytes, identical order, no math touched.
+    void prefetchExpert(int layer, int expertId);
+
     // Shared-expert projection access (staged through the LRU as pseudo-experts).
     // Each slot copies into its own scratch, so all three pointers from a single
     // layer stay valid simultaneously.
@@ -93,6 +100,11 @@ public:
     size_t lruUsedBytes() const;
     size_t lruCapacityBytes() const;
 
+    // O7: warm the always-read dense tensor ranges into the OS page cache with
+    // sequential discard reads before the first forward (kills the cold page-fault
+    // storm that dominated token-1). No-op when the index is unavailable.
+    void warmDenseWeights();
+
     ExpertLRU& lru() { return lru_; }
 
 private:
@@ -100,13 +112,20 @@ private:
     std::vector<int> predictNextLayerExperts(int nextLayer, const std::vector<int>& currentTopK);
 
     // Async prefetch expert set via IOCP (batched per shard, correct offsets).
-    void prefetchAsync(const std::vector<std::pair<int, int>>& experts);
+    // `demand = true` marks the current layer's routed winners (guaranteed to be
+    // consumed immediately): it bypasses the O2 speculative cap so the layer's
+    // loads overlap on the disk instead of degrading to serial mmap faults (O6).
+    void prefetchAsync(const std::vector<std::pair<int, int>>& experts, bool demand = false);
 
     // Synchronously load full expert [gate|up|down] from disk via mmap.
     bool loadExpertFromDisk(int layer, int expertId, BufferHandle& out);
 
     // True when key is resident in the LRU or already in an in-flight prefetch.
     bool probe(ExpertKey key);
+
+    // O13c: size of the in-flight expert-key set (sampled at each layer's first
+    // getter wait to report the queue depth that pacing controls).
+    int64_t inFlightKeysSnapshot() const;
 
     ExpertLRU lru_;
     IOCPReader iocp_;
@@ -115,6 +134,7 @@ private:
 
     // Previous token's Top-K per layer (prediction basis).
     std::vector<std::vector<int>> lastTopK_;
+    std::vector<float> overlapEma_;
 
     // Router probabilities of the previous token per layer (same order).
     std::vector<std::vector<std::pair<int, float>>> lastTopKProbs_;
@@ -133,7 +153,18 @@ private:
     // Step counter for expert reuse-distance telemetry (incremented once per
     // onLayerRouterDone call = one routing event).
     uint64_t routingStep_ = 0;
+    // O13c (doc/design.md 17.12): routing step whose first getter wait has
+    // already been timed, so only the layer's FIRST wait feeds
+    // InferenceStats::firstExpertWaitNs (the pre-compute head-of-line cost).
+    uint64_t demandFirstWaitStep_ = UINT64_MAX;
     std::unordered_map<ExpertKey, uint64_t, ExpertKeyHash> lastUseStep_;
+
+    // O8c (doc/design.md 17.9): experts named by routed lookahead guesses that
+    // survived the spec gate. Erased when a real demand lookup consumes them, so
+    // the report can separate junk reads (never referenced) from delivered ones.
+    // Accessed only from the generation thread (callers of onLayerRouterDone /
+    // getExpertPtr / getSharedProjectionPtr), so no lock is needed.
+    std::unordered_set<ExpertKey, ExpertKeyHash> routedPredKeys_;
 
     // Compute-side staging buffers. getExpertPtr/getSharedProjectionPtr return
     // pointers into these; contents are copied from the LRU/disk under lock so
@@ -142,7 +173,7 @@ private:
     std::vector<uint8_t> shScratch_[3];     // one per shared slot (gate/up/down)
 
     // Keys currently in flight (guarded; touched by IOCP workers and the caller).
-    std::mutex inFlightMtx_;
+    mutable std::mutex inFlightMtx_;
     std::unordered_set<ExpertKey, ExpertKeyHash> prefetchedInFlight_;
 
     // Record a routing event for reuse-distance / LRU telemetry (expert consumed).

@@ -26,6 +26,49 @@ public:
     std::atomic<uint64_t> prefetchInserted{0};    // assemblies landed in the LRU
     std::atomic<uint64_t> prefetchWasted{0};      // prefetched entry evicted before first use
 
+    // O8c (doc/design.md 17.9): precision accounting for the routed-lookahead
+    // stream. routedPredStaged = guesses that survived the gate; routedPredConsumed
+    // = guesses a real demand later hit in the LRU; demandKeysStaged = current-layer
+    // demand keys submitted on the O6 path; demandWaitTimeout = O6 waiters that
+    // timed out and re-loaded synchronously.
+    std::atomic<uint64_t> routedPredStaged{0};
+    std::atomic<uint64_t> routedPredConsumed{0};
+    std::atomic<uint64_t> demandKeysStaged{0};
+    std::atomic<uint64_t> demandWaitTimeout{0};
+
+    // O9c (doc/design.md 17.11): the round-4 counters could not see the
+    // synchronous fallback (a blocking mmap copy whose bytes bypass
+    // diskBytesRead) nor the cost of waiting on the demand pipeline.
+    // syncLoads/syncBytes/syncStallNs = the blocking path; demandWaitNs = the
+    // forward thread's total poll time on demand assemblies; stageSkipLru =
+    // keys prefetchAsync left alone because they were already resident (O10).
+    std::atomic<uint64_t> syncLoads{0};
+    std::atomic<uint64_t> syncBytes{0};
+    std::atomic<uint64_t> syncStallNs{0};
+    std::atomic<uint64_t> demandWaitNs{0};
+    std::atomic<uint64_t> stageSkipLru{0};
+
+// O13c (doc/design.md 17.12): pacing instrumentation, kept after the pacing
+    // change itself was reverted -- it is the only way to see inside this host's
+    // +/-4.5 % run-to-run wall-clock noise. firstExpertWaitNs = how long each
+    // layer's FIRST getter waited, i.e. the head-of-line cost before any expert
+    // FFN can start; layerFirstWaitCount = how many layers were sampled.
+    // loopPrefetchIssued = look-ahead submissions that were not already in
+    // flight or resident (proves how often the look-ahead is a no-op).
+    std::atomic<uint64_t> loopPrefetchIssued{0};
+    std::atomic<uint64_t> firstExpertWaitNs{0};
+    std::atomic<uint64_t> layerFirstWaitCount{0};
+
+    // O13c: the queue depth that pacing is supposed to control, sampled exactly
+    // at each layer's first getter wait (i.e. when the forward is about to
+    // block). "reads in flight" = submitted-but-not-yet-completed shard runs =
+    // the number of files the drive is interleaving; "experts in flight" = the
+    // number of expert keys currently being assembled. Both are reported as
+    // per-layer averages over layerFirstWaitCount.
+    std::atomic<int64_t> runsInFlight{0};
+    std::atomic<uint64_t> firstWaitRunsInFlight{0};
+    std::atomic<uint64_t> firstWaitKeysInFlight{0};
+
     // IO telemetry (bytes moved through the prefetch pipeline)
     std::atomic<uint64_t> diskBytesRead{0};
     std::atomic<uint64_t> sequentialBytes{0};     // bytes inside merged sequential runs
@@ -59,6 +102,21 @@ public:
         prefetchSubmitted = 0;
         prefetchInserted = 0;
         prefetchWasted = 0;
+        routedPredStaged = 0;
+        routedPredConsumed = 0;
+        demandKeysStaged = 0;
+        demandWaitTimeout = 0;
+        syncLoads = 0;
+        syncBytes = 0;
+        syncStallNs = 0;
+        demandWaitNs = 0;
+        stageSkipLru = 0;
+        loopPrefetchIssued = 0;
+        firstExpertWaitNs = 0;
+        layerFirstWaitCount = 0;
+        runsInFlight = 0;
+        firstWaitRunsInFlight = 0;
+        firstWaitKeysInFlight = 0;
         diskBytesRead = 0;
         sequentialBytes = 0;
         randomIoCount = 0;
@@ -97,6 +155,27 @@ public:
           << ",\"prefetch_wasted\":" << prefetchWasted.load()
           << ",\"prefetch_delivery_rate\":" << ratio(prefetchInserted.load(), prefetchSubmitted.load())
           << ",\"prefetch_waste_rate\":" << ratio(prefetchWasted.load(), prefetchSubmitted.load())
+          << ",\"routed_pred_staged\":" << routedPredStaged.load()
+          << ",\"routed_pred_consumed\":" << routedPredConsumed.load()
+          << ",\"routed_pred_waste_rate\":" << routedWasteRate()
+          << ",\"demand_keys_staged\":" << demandKeysStaged.load()
+          << ",\"demand_wait_timeout\":" << demandWaitTimeout.load()
+          << ",\"sync_loads\":" << syncLoads.load()
+          << ",\"sync_bytes\":" << syncBytes.load()
+          << ",\"sync_stall_ms\":" << (syncStallNs.load() / 1e6)
+          << ",\"demand_wait_ms\":" << (demandWaitNs.load() / 1e6)
+          << ",\"stage_skip_lru\":" << stageSkipLru.load()
+          << ",\"loop_prefetch_issued\":" << loopPrefetchIssued.load()
+          << ",\"first_expert_wait_ms\":"
+          << (layerFirstWaitCount.load() ? firstExpertWaitNs.load() / 1e6 /
+                                               double(layerFirstWaitCount.load()) : 0.0)
+          << ",\"reads_in_flight_at_first_wait\":"
+          << (layerFirstWaitCount.load() ? double(firstWaitRunsInFlight.load()) /
+                                               double(layerFirstWaitCount.load()) : 0.0)
+          << ",\"experts_in_flight_at_first_wait\":"
+          << (layerFirstWaitCount.load() ? double(firstWaitKeysInFlight.load()) /
+                                               double(layerFirstWaitCount.load()) : 0.0)
+          << ",\"total_disk_bytes\":" << (diskBytesRead.load() + syncBytes.load())
           << ",\"disk_bytes_read\":" << diskBytesRead.load()
           << ",\"sequential_bytes\":" << sequentialBytes.load()
           << ",\"random_io_count\":" << randomIoCount.load()
@@ -122,6 +201,12 @@ private:
     }
     static double ratio(uint64_t a, uint64_t b) {
         return b == 0 ? 0.0 : double(a) / double(b);
+    }
+    double routedWasteRate() const {
+        uint64_t staged = routedPredStaged.load();
+        if (staged == 0) return 0.0;
+        uint64_t consumed = routedPredConsumed.load();
+        return consumed >= staged ? 0.0 : double(staged - consumed) / double(staged);
     }
     static double avgInt(uint64_t sum, uint64_t count) {
         return count == 0 ? 0.0 : double(sum) / double(count);

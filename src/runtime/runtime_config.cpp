@@ -330,8 +330,11 @@ AdaptiveConfig computeAdaptiveConfig(const SystemProfile& profile,
         c.iocpWorkers = std::max<int>(1, std::min<int>(overrides.iocpWorkers, 16));
         c.hasOverrides = true;
     } else {
-        // Scale disk-read parallelism with host core count (1..8 workers).
-        c.iocpWorkers = std::max<int>(1, std::min<int>(8, std::max<int>(2, c.computeThreads / 4)));
+        // O5 (doc/design.md 17.5): scale disk-read parallelism with host core
+        // count (3..16 workers). Deeper in-flight I/O lets the drive reorder the
+        // ~2-3 concurrent per-layer read streams; a single HDD serves scattered
+        // mid-size runs faster when the queue is deeper than the old 2..8 knob.
+        c.iocpWorkers = std::max<int>(1, std::min<int>(16, std::max<int>(3, c.computeThreads / 2)));
     }
 
     c.gpuName = c.gpu == profile.gpu.backend ? profile.gpu.name : std::string("none");

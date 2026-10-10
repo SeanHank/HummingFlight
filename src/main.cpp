@@ -554,6 +554,14 @@ int main(int argc, char** argv) {
     scheduler.setRouterPrefetch(args.routerPrefetchExtra, args.probPriority);
     if (args.emaPredictor) scheduler.setPopularityPredictor(args.emaAlpha, true);
 
+    // O7 (doc/design.md 17.7): pre-warm the always-read dense + shared tensors
+    // into the OS page cache with big sequential reads before the first forward,
+    // replacing the cold page-fault storm that used to dominate token-1. Skip
+    // with GLM_NO_WARM=1 (e.g. to measure a deliberately cold run).
+    if (!std::getenv("GLM_NO_WARM")) {
+        scheduler.warmDenseWeights();
+    }
+
     GLMForward forwarder(weightIndex);
     if (!forwarder.init()) {
         GLM_LOG_ERROR("Forward engine initialization failed");

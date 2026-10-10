@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import shutil
 import subprocess
@@ -53,6 +54,51 @@ from common import (
 
 PY = sys.executable
 SCRIPTS_DIR = ROOT / "scripts"
+
+
+def has_module(python: str, module: str) -> bool:
+    """True when `python` can import `module` (or when it is runnable at all)."""
+    try:
+        return subprocess.run(
+            [python, "-c", f"import {module}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    except (OSError, ValueError):
+        return False
+
+
+def resolve_python(explicit: str | None) -> str:
+    """Pick the interpreter for the model-dependent gates and say which one.
+
+    The default `sys.executable` on this host has no pytest (that is exactly how
+    the first packaged run died at gate 3/9 with `No module named pytest`), so
+    the interpreter is verified BEFORE the pipeline starts instead of half-way
+    through it, and a working one is substituted automatically when the default
+    is unusable. An explicit --python is honoured strictly: it is never silently
+    replaced, it is only validated.
+    """
+    if explicit:
+        if not has_module(explicit, "pytest"):
+            raise SystemExit(
+                f"ERROR: --python {explicit} cannot `import pytest` "
+                "(use a python with the project's test deps installed)"
+            )
+        return explicit
+
+    wanted = []
+    if os.environ.get("GLM_PYTHON"):
+        wanted.append(("$GLM_PYTHON", os.environ["GLM_PYTHON"]))
+    wanted.append(("sys.executable", sys.executable))
+    for why, cand in wanted:
+        if cand and has_module(cand, "pytest"):
+            if why != "sys.executable":
+                print(f"Gate interpreter: {cand} (selected by {why})")
+            return cand
+    tried = ", ".join(f"{why}={cand}" for why, cand in wanted if cand)
+    raise SystemExit(
+        f"ERROR: no usable python interpreter (need one that can `import pytest`): {tried}\n"
+        "       pass --python <path> or set GLM_PYTHON"
+    )
 
 CMAKE_BASE = [
     "cmake", "-S", ".", "-B", "build",
@@ -110,12 +156,16 @@ def main() -> int:
     ap.add_argument("--version", default=None, help="bump version before packaging")
     ap.add_argument("--skip-cpack", action="store_true", help="skip archive creation")
     ap.add_argument("--python", default=None, help="python interpreter for the tokenizer/gates")
+    ap.add_argument("--label", default="release", help="benchmark history label for the L4 run")
     args = ap.parse_args()
 
-    version = sync_version(args.version)
+    # Interpreter first: gate 3/9 (pytest) runs under this one, and the version
+    # sync below must run under it too -- the old ordering resolved PY *after*
+    # sync_version(), so --python was silently ignored for the sync step.
     global PY
-    if args.python:
-        PY = args.python
+    PY = resolve_python(args.python)
+
+    version = sync_version(args.version)
     print(f"Project version: {version}")
 
     report = MarkdownReport("HummingFlight Release Gate Report", version).header()
@@ -160,7 +210,7 @@ def main() -> int:
         return 1
 
     # 5) L4 performance benchmark (PASS/FAIL, blocks release; requires real model)
-    l4 = [PY, str(SCRIPTS_DIR / "benchmark.py"), "--report"]
+    l4 = [PY, str(SCRIPTS_DIR / "benchmark.py"), "--report", "--label", args.label]
     l4 += ["--model", gate_model] if gate_model else []
     if run_or_record(l4, "5/9 L4 performance benchmark", report,
                      "L4 performance benchmark") != 0:

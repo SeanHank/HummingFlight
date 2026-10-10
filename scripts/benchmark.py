@@ -29,6 +29,15 @@ from common import (
 
 SPEED_RE = re.compile(r"Speed:\s*([\d.]+)\s*tok/s", re.IGNORECASE)
 STATS_RE = re.compile(r"STATS:\s*(\{.*\})", re.DOTALL)
+TOKEN_RE = re.compile(r"\] token=(\d+)")
+OUTPUT_RE = re.compile(r"Output ids:\s*([\d,\s]+)")
+
+# Cross-round comparison history. benchmark.py rewrites benchmark_report.md
+# wholesale on every run, so a hand-appended comparison table cannot survive;
+# the records live in reports/benchmark_history.json and the table is rendered
+# from them on each run. Entries are keyed by "<config>|<label>": re-running a
+# label overwrites that round's row instead of appending a duplicate.
+HISTORY_PATH = REPORTS / "benchmark_history.json"
 
 # I/O & cache telemetry rows rendered from the engine's `STATS:` JSON line.
 # Each entry: (report label, stats key, formatter, unit suffix)
@@ -58,6 +67,21 @@ TELEMETRY_ROWS = (
     ("Expert disk (sync) loads", "expert_disk_loads", lambda v: f"{int(float(v))}", ""),
     ("Prefetch delivery rate", "prefetch_delivery_rate", _pct, ""),
     ("Prefetch waste rate", "prefetch_waste_rate", _pct, ""),
+    ("Routed-pred staged (gate survivors)", "routed_pred_staged", lambda v: f"{int(float(v))}", ""),
+    ("Routed-pred consumed", "routed_pred_consumed", lambda v: f"{int(float(v))}", ""),
+    ("Routed-pred waste rate", "routed_pred_waste_rate", _pct, ""),
+    ("Demand keys staged", "demand_keys_staged", lambda v: f"{int(float(v))}", ""),
+    ("Demand wait timeouts", "demand_wait_timeout", lambda v: f"{int(float(v))}", ""),
+    ("Sync (mmap) fallback loads", "sync_loads", lambda v: f"{int(float(v))}", ""),
+    ("Sync (mmap) fallback bytes", "sync_bytes", _human_bytes, ""),
+    ("Sync (mmap) stall", "sync_stall_ms", _num, "ms"),
+    ("Demand wait (forward thread)", "demand_wait_ms", _num, "ms"),
+    ("Staging skipped (LRU hit)", "stage_skip_lru", lambda v: f"{int(float(v))}", ""),
+    ("Loop look-ahead issued (O12/O13b)", "loop_prefetch_issued", lambda v: f"{int(float(v))}", ""),
+    ("First-expert wait / layer (O13c)", "first_expert_wait_ms", _num, "ms"),
+    ("Reads in flight @ first wait (O13c)", "reads_in_flight_at_first_wait", _num, ""),
+    ("Experts in flight @ first wait (O13c)", "experts_in_flight_at_first_wait", _num, ""),
+    ("Total disk bytes (async+sync)", "total_disk_bytes", _human_bytes, ""),
     ("Random I/O runs", "random_io_count", lambda v: f"{int(float(v))}", ""),
     ("I/O read requests", "io_read_count", lambda v: f"{int(float(v))}", ""),
     ("Disk bytes read", "disk_bytes_read", _human_bytes, ""),
@@ -118,6 +142,107 @@ def parse_stats(output: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def parse_output_ids(output: str) -> list[int]:
+    """Generated token ids, from the engine's 'Output ids:' line (per-token markers
+    are the fallback when that summary line is absent)."""
+    summary = OUTPUT_RE.search(output)
+    if summary:
+        return [int(tok) for tok in re.findall(r"\d+", summary.group(1))]
+    return [int(tok) for tok in TOKEN_RE.findall(output)]
+
+
+def _load_history() -> dict:
+    if HISTORY_PATH.exists():
+        try:
+            data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"records": {}}
+        if isinstance(data, dict) and isinstance(data.get("records"), dict):
+            return data
+    return {"records": {}}
+
+
+def record_history(label: str, config: str, metrics: dict, output_ids: list[int]) -> None:
+    """Persist this round's numbers so the comparison table survives regeneration."""
+    telemetry = metrics.get("telemetry") or {}
+    disk = telemetry.get("disk_bytes_read")
+    sync = telemetry.get("sync_bytes")
+    total_bytes = telemetry.get("total_disk_bytes")
+    if total_bytes is None and disk is not None:
+        total_bytes = disk
+    hist = _load_history()
+    hist["records"][f"{config}|{label}"] = {
+        "label": label,
+        "config": config,
+        "total_sec": metrics.get("total_sec"),
+        "speed_tok_per_s": metrics.get("speed_tok_per_s"),
+        "disk_bytes_read": disk,
+        "sync_bytes": sync,
+        "total_disk_bytes": total_bytes,
+        "prefetch_waste_rate": telemetry.get("prefetch_waste_rate"),
+        "output_ids": output_ids,
+    }
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_PATH.write_text(
+        json.dumps(hist, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def render_comparison(report: MarkdownReport, config: str) -> None:
+    """Render the cross-round table for one workload config from the history file."""
+    records = [rec for rec in _load_history()["records"].values()
+               if rec.get("config") == config]
+    if not records:
+        return
+    records.sort(key=lambda r: (r.get("total_sec") is None, r.get("total_sec") or 0.0))
+    best = records[0]
+
+    def _col(rec: dict, key: str) -> str:
+        value = rec.get(key)
+        if value is None:
+            return "—"
+        return f"**{value}**" if rec is best else str(value)
+
+    report.section(f"Run comparison (standalone L4, same config `{config}`)")
+    report.table(["Metric"] + [str(rec["label"]) for rec in records])
+
+    def _fmt(key: str, suffix: str = "") -> list[str]:
+        cells = []
+        for rec in records:
+            value = rec.get(key)
+            cell = "—" if value is None else f"{value}{suffix}"
+            cells.append(f"**{cell}**" if rec is best else cell)
+        return cells
+
+    speed = []
+    for rec in records:
+        value = rec.get("speed_tok_per_s")
+        cell = "—" if value is None else f"{float(value):.6f}"
+        speed.append(f"**{cell}**" if rec is best else cell)
+    disk = []
+    for rec in records:
+        value = rec.get("total_disk_bytes")
+        cell = "—" if value is None else _human_bytes(value)
+        disk.append(f"**{cell}**" if rec is best else cell)
+    output = []
+    for rec in records:
+        ids = rec.get("output_ids") or []
+        cell = "`" + ",".join(str(i) for i in ids) + "`" if ids else "—"
+        output.append(f"**{cell}**" if rec is best else cell)
+
+    report.row(["total_sec"] + _fmt("total_sec", " s"))
+    report.row(["speed_tok_per_s"] + speed)
+    report.row(["Total disk bytes (whole run)"] + disk)
+    report.row(["Prefetch waste"] + [
+        "—" if rec.get("prefetch_waste_rate") is None
+        else f"{float(rec['prefetch_waste_rate']) * 100:.1f} %" for rec in records])
+    report.row(["Generated output"] + output)
+    report.text("")
+    identical = {tuple(rec.get("output_ids") or []) for rec in records if rec.get("output_ids")}
+    if len(identical) == 1 and len(records) > 1:
+        report.text(f"> Output bit-identical across all {len(records)} runs.")
+        report.text("")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="HummingFlight performance benchmark (L4 gate)")
     ap.add_argument("--model", default=None,
@@ -128,6 +253,9 @@ def main() -> int:
                     help="tokens to generate")
     ap.add_argument("--report", action="store_true",
                     help="write reports/benchmark_report.md + JSON")
+    ap.add_argument("--label", default="unlabelled",
+                    help="label for this run in the cross-round comparison table "
+                         "(e.g. R5; re-using a label overwrites that row)")
     args = ap.parse_args()
 
     model_dir = find_model_dir(args.model)
@@ -190,6 +318,9 @@ def main() -> int:
     report.summary()
 
     if args.report:
+        config = f"--prompt-tokens {args.prompt_tokens_csv} --max-tokens {args.max_tokens}"
+        record_history(args.label, config, metrics, parse_output_ids(out))
+        render_comparison(report, config)
         out_path = write_report(report, "benchmark_report.md")
         raw_path = REPORTS / "benchmark_raw.json"
         raw_path.write_text(

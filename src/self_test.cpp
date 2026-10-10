@@ -775,9 +775,9 @@ void testAdaptiveConfig() {
     CHECK(c0.ramBudgetBytes >= c0.lruBytes, "Adaptive: RAM budget >= LRU");
     CHECK(c0.ramBudgetBytes <= 16 * GiB, "Adaptive: RAM budget within physical RAM");
     CHECK(c0.vramBudgetBytes == 0, "Adaptive: no VRAM budget on CPU-only host");
-    CHECK(c0.iocpWorkers >= 1 && c0.iocpWorkers <= 8 &&
-          c0.iocpWorkers == std::min(8, std::max(2, 8 / 4)),
-          "Adaptive: IOCP workers scaled from cores");
+    CHECK(c0.iocpWorkers >= 1 && c0.iocpWorkers <= 16 &&
+          c0.iocpWorkers == std::min(16, std::max(3, 8 / 2)),
+          "Adaptive: IOCP workers scaled from cores (O5)");
 
     // O1: large-RAM CPU-only hosts hit the 40 GiB LRU cap (one forward footprint).
     SystemProfile bigHost = cpuHost;
