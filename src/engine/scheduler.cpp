@@ -633,7 +633,7 @@ int64_t Scheduler::inFlightKeysSnapshot() const {
 void Scheduler::prefetchExpert(int layer, int expertId) {
     if (layer < 0 || layer >= index_->config.numLayers) return;
     if (expertId < 0 || expertId >= index_->config.numLocalExperts) return;
-    ExpertKey key{uint32_t(layer), uint32_t(expertId)};
+    ExpertKey key{uint32_t(layer), uint16_t(expertId)};
     {
         std::lock_guard<std::mutex> guard(inFlightMtx_);
         if (prefetchedInFlight_.count(key)) return;  // already loading
@@ -887,7 +887,7 @@ void Scheduler::warmDenseWeights() {
 
     for (const auto& r : runs) {
         for (uint64_t pos = r.start; pos < r.end; pos += kWarmChunk) {
-            submit(r.shard, pos, std::min(kWarmChunk, r.end - pos));
+            submit(r.shard, pos, std::min(uint64_t(kWarmChunk), r.end - pos));
         }
     }
     warm.waitAll();
